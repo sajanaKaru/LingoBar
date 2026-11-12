@@ -44,6 +44,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var viewModel = AppViewModel()
     private var globalMonitor: Any?
+    private var localMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let contentView = MainContentView(vm: viewModel, onClose: { [weak self] in
@@ -66,14 +67,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
 
-        // Setup Global Hotkey Monitor (Option + Space OR Option + Shift + L)
+        // Global Hotkey Monitor (Option + Space OR Option + Shift + L)
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            // Option + Shift + L (keyCode 37) or Option + Space (keyCode 49)
             if (flags == [.option, .shift] && event.keyCode == 37) ||
                (flags == [.option] && event.keyCode == 49) {
                 self?.triggerInstantAction()
             }
+        }
+
+        // Local Monitor for when the app is active
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            if event.keyCode == 53 { // Escape
+                self?.dismissHUD()
+                return nil
+            }
+            return event
         }
     }
 
@@ -87,6 +96,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func dismissHUD() {
         panel.orderOut(nil)
+        viewModel.copied = false
     }
 
     func triggerInstantAction() {
@@ -95,7 +105,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Capture highlighted text with clipboard preservation
+        viewModel.copied = false
+
+        // Capture highlighted text with safe clipboard preservation
         captureSelectedText { [weak self] capturedText in
             guard let self = self else { return }
             let text = capturedText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -109,27 +121,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Captures selected text via Accessibility API if available, or simulated Cmd+C with clipboard restore
+    /// Captures selected text via Accessibility API if available, or simulated Cmd+C with strict clipboard preservation
     private func captureSelectedText(completion: @escaping (String) -> Void) {
-        // Try Accessibility API first
+        // 1. Try Accessibility API first (zero clipboard impact)
         if let axText = getSelectedTextViaAccessibility(), !axText.isEmpty {
             completion(axText)
             return
         }
 
-        // Fallback: Backup current clipboard, simulate Cmd+C, read text, restore clipboard
+        // 2. Safe Fallback: Capture pasteboard items snapshot before synthetic copy
         let pasteboard = NSPasteboard.general
-        let previousString = pasteboard.string(forType: .string)
+        let initialChangeCount = pasteboard.changeCount
+
+        // Backup existing pasteboard items
+        var savedItems: [[NSPasteboard.PasteboardType: Data]] = []
+        if let items = pasteboard.pasteboardItems {
+            for item in items {
+                var itemDict: [NSPasteboard.PasteboardType: Data] = [:]
+                for type in item.types {
+                    if let data = item.data(forType: type) {
+                        itemDict[type] = data
+                    }
+                }
+                if !itemDict.isEmpty {
+                    savedItems.append(itemDict)
+                }
+            }
+        }
 
         simulateCopy()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            let captured = pasteboard.string(forType: .string) ?? ""
-            // Restore previous clipboard state so user's clipboard history remains intact
-            if let prev = previousString, prev != captured {
-                // Keep the captured text for the app, but restore clipboard if needed or preserve
+        // Wait 90ms for simulated copy event to register
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
+            var capturedText = ""
+            // Ensure changeCount actually incremented, meaning a fresh copy occurred
+            if pasteboard.changeCount != initialChangeCount {
+                capturedText = pasteboard.string(forType: .string) ?? ""
             }
-            completion(captured)
+
+            // Restore previous pasteboard contents faithfully
+            if !savedItems.isEmpty {
+                pasteboard.clearContents()
+                for itemDict in savedItems {
+                    let pbItem = NSPasteboardItem()
+                    for (type, data) in itemDict {
+                        pbItem.setData(data, forType: type)
+                    }
+                    pasteboard.writeObjects([pbItem])
+                }
+            }
+
+            completion(capturedText)
         }
     }
 
@@ -162,7 +204,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - View Model & Groq Streaming Engine
+// MARK: - View Model & Groq Engine with Request Generation Guards
 enum AppTab {
     case translate
     case polish
@@ -179,6 +221,7 @@ class AppViewModel: ObservableObject {
 
     private let apiKey: String
     private var currentTask: URLSessionDataTask?
+    private var currentRequestId: UUID = UUID()
 
     init() {
         let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
@@ -195,6 +238,7 @@ class AppViewModel: ObservableObject {
         isLoading = true
         errorMessage = ""
         outputText = ""
+        copied = false
 
         let prompt = """
         You are an expert English-to-Sinhala translator focused on zero-friction natural clarity.
@@ -217,6 +261,7 @@ class AppViewModel: ObservableObject {
         isLoading = true
         errorMessage = ""
         outputText = ""
+        copied = false
 
         let prompt = """
         You are an elite English writing assistant and copy editor.
@@ -235,6 +280,8 @@ class AppViewModel: ObservableObject {
 
     private func callGroq(prompt: String) {
         currentTask?.cancel()
+        let requestId = UUID()
+        currentRequestId = requestId
 
         guard !apiKey.isEmpty else {
             self.isLoading = false
@@ -249,21 +296,22 @@ class AppViewModel: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // Using llama-3.3-70b-versatile for high quality and speed
         let body: [String: Any] = [
             "model": "llama-3.3-70b-versatile",
             "messages": [
                 ["role": "user", "content": prompt]
             ],
             "temperature": 0.2,
-            "max_tokens": 1024
+            "max_tokens": 2048
         ]
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         currentTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.currentRequestId == requestId else {
+                    return // Ignore responses from cancelled / outdated requests
+                }
                 self.isLoading = false
 
                 if let error = error as NSError?, error.code == NSURLErrorCancelled {
@@ -288,11 +336,17 @@ class AppViewModel: ObservableObject {
                         }
 
                         if let choices = json["choices"] as? [[String: Any]],
-                           let first = choices.first,
-                           let message = first["message"] as? [String: Any],
-                           let content = message["content"] as? String {
-                            self.outputText = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                            return
+                           let first = choices.first {
+                            let finishReason = first["finish_reason"] as? String
+                            if let message = first["message"] as? [String: Any],
+                               let content = message["content"] as? String {
+                                var finalOutput = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if finishReason == "length" {
+                                    finalOutput += "\n\n⚠️ [Output truncated due to token length limit]"
+                                }
+                                self.outputText = finalOutput
+                                return
+                            }
                         }
                     }
                     self.errorMessage = "Invalid response format from Groq."
@@ -309,7 +363,7 @@ class AppViewModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(outputText, forType: .string)
         copied = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             onDismiss()
         }
     }
@@ -396,6 +450,7 @@ struct MainContentView: View {
                         Button("Clear") {
                             vm.inputText = ""
                             vm.outputText = ""
+                            vm.copied = false
                         }
                         .buttonStyle(.plain)
                         .font(.system(size: 11))
