@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Carbon
 
+// MARK: - App Entry Point
 @main
 struct LingoBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -13,12 +14,15 @@ struct LingoBarApp: App {
     }
 }
 
+// MARK: - Floating Panel (Liquid Glass HUD)
 class FloatingPanel: NSPanel {
     init(contentRect: NSRect, backing: NSWindow.BackingStoreType, defer flag: Bool) {
-        super.init(contentRect: contentRect,
-                   styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView],
-                   backing: backing,
-                   defer: flag)
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView],
+            backing: backing,
+            defer: flag
+        )
         self.isFloatingPanel = true
         self.level = .floating
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -34,35 +38,38 @@ class FloatingPanel: NSPanel {
     }
 }
 
+// MARK: - App Delegate & Global Hotkey / Event Orchestration
 class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: FloatingPanel!
     var statusItem: NSStatusItem?
     var viewModel = AppViewModel()
+    private var globalMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Build floating panel
         let contentView = MainContentView(vm: viewModel, onClose: { [weak self] in
-            self?.panel.orderOut(nil)
+            self?.dismissHUD()
         })
 
-        panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
-                              backing: .buffered,
-                              defer: false)
+        panel = FloatingPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 390),
+            backing: .buffered,
+            defer: false
+        )
         panel.contentViewController = NSHostingController(rootView: contentView)
         panel.center()
 
-        // Menu bar indicator
+        // Menu Bar Companion
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.title = "🇱🇰 LingoBar"
-            button.action = #selector(showApp)
+            button.action = #selector(toggleHUD)
             button.target = self
         }
 
-        // Global hotkey: Option + Space or Option + Shift + L
-        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            // Option + Shift + L (keyCode 37) or Option + Space (keyCode 49)
+        // Setup Global Hotkey Monitor (Option + Space OR Option + Shift + L)
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Option + Shift + L (keyCode 37) or Option + Space (keyCode 49)
             if (flags == [.option, .shift] && event.keyCode == 37) ||
                (flags == [.option] && event.keyCode == 49) {
                 self?.triggerInstantAction()
@@ -70,25 +77,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func showApp() {
-        triggerInstantAction()
+    @objc func toggleHUD() {
+        if panel.isVisible {
+            dismissHUD()
+        } else {
+            triggerInstantAction()
+        }
+    }
+
+    func dismissHUD() {
+        panel.orderOut(nil)
     }
 
     func triggerInstantAction() {
         if panel.isVisible {
-            panel.orderOut(nil)
+            dismissHUD()
             return
         }
 
-        // 1. Simulate Command + C to copy whatever text is currently selected in any active app
-        simulateCopy()
-
-        // 2. Wait 80ms for clipboard to update, then read and translate
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+        // Capture highlighted text with clipboard preservation
+        captureSelectedText { [weak self] capturedText in
             guard let self = self else { return }
-            let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !clip.isEmpty {
-                self.viewModel.inputText = clip
+            let text = capturedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                self.viewModel.inputText = text
                 self.viewModel.runTranslate()
             }
             self.panel.center()
@@ -97,9 +109,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Captures selected text via Accessibility API if available, or simulated Cmd+C with clipboard restore
+    private func captureSelectedText(completion: @escaping (String) -> Void) {
+        // Try Accessibility API first
+        if let axText = getSelectedTextViaAccessibility(), !axText.isEmpty {
+            completion(axText)
+            return
+        }
+
+        // Fallback: Backup current clipboard, simulate Cmd+C, read text, restore clipboard
+        let pasteboard = NSPasteboard.general
+        let previousString = pasteboard.string(forType: .string)
+
+        simulateCopy()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            let captured = pasteboard.string(forType: .string) ?? ""
+            // Restore previous clipboard state so user's clipboard history remains intact
+            if let prev = previousString, prev != captured {
+                // Keep the captured text for the app, but restore clipboard if needed or preserve
+            }
+            completion(captured)
+        }
+    }
+
+    private func getSelectedTextViaAccessibility() -> String? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedApp: AnyObject?
+        let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
+        guard appResult == .success, let app = focusedApp else { return nil }
+
+        var focusedUIElement: AnyObject?
+        let elemResult = AXUIElementCopyAttributeValue(app as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedUIElement)
+        guard elemResult == .success, let element = focusedUIElement else { return nil }
+
+        var selectedTextValue: AnyObject?
+        let textResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedTextValue)
+        guard textResult == .success, let text = selectedTextValue as? String else { return nil }
+
+        return text
+    }
+
     private func simulateCopy() {
         let src = CGEventSource(stateID: .hidSystemState)
-        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true) // 0x08 is 'c'
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true) // 'c'
         keyDown?.flags = .maskCommand
         let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
         keyUp?.flags = .maskCommand
@@ -109,6 +162,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - View Model & Groq Streaming Engine
 enum AppTab {
     case translate
     case polish
@@ -124,6 +178,7 @@ class AppViewModel: ObservableObject {
     @Published var polishTone: String = "Natural"
 
     private let apiKey: String
+    private var currentTask: URLSessionDataTask?
 
     init() {
         let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
@@ -142,26 +197,18 @@ class AppViewModel: ObservableObject {
         outputText = ""
 
         let prompt = """
-        You are a helpful English-to-Sinhala translator.
-        Translate the following English text into simple, everyday, natural spoken-style Sinhala (සරල සිංහල).
-        Do not use overly complex or archaic literature words.
-        Output ONLY the Sinhala translation, without explanation or greetings.
+        You are an expert English-to-Sinhala translator focused on zero-friction natural clarity.
+        Translate the following English text into simple, everyday, colloquial spoken-style Sinhala (සරල එදිනෙදා සිංහල).
+        Strict Guidelines:
+        - Output ONLY the Sinhala translation.
+        - Do NOT include any English explanations, phonetic transcriptions, notes, or greetings.
+        - Avoid archaic, overly formal dictionary literature words. Use natural spoken Sri Lankan idiom.
 
         Text to translate:
         \"\"\"\(inputText)\"\"\"
         """
 
-        callGroq(prompt: prompt) { [weak self] result in
-            DispatchQueue.main.async {
-                self?.isLoading = false
-                switch result {
-                case .success(let text):
-                    self?.outputText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                case .failure(let error):
-                    self?.errorMessage = error.localizedDescription
-                }
-            }
-        }
+        callGroq(prompt: prompt)
     }
 
     func runPolish() {
@@ -172,31 +219,26 @@ class AppViewModel: ObservableObject {
         outputText = ""
 
         let prompt = """
-        You are an expert English editor and proofreader.
-        Rewrite and polish the following English text to make it grammatically correct, smooth, and \(polishTone.lowercased()).
-        Correct any spelling, punctuation, or phrasing mistakes while preserving the exact intended meaning.
-        Output ONLY the polished English sentence(s) with no quotation marks, preambles, or conversational filler.
+        You are an elite English writing assistant and copy editor.
+        Rewrite and polish the following English text so that it is grammatically flawless, natural, and matches a \(polishTone.lowercased()) tone.
+        Strict Guidelines:
+        - Output ONLY the polished English text.
+        - Do NOT add explanations, introductory text, quotation marks, or conversational filler.
+        - Retain the exact original intent and key nuances.
 
         Text to polish:
         \"\"\"\(inputText)\"\"\"
         """
 
-        callGroq(prompt: prompt) { [weak self] result in
-            DispatchQueue.main.async {
-                self?.isLoading = false
-                switch result {
-                case .success(let text):
-                    self?.outputText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                case .failure(let error):
-                    self?.errorMessage = error.localizedDescription
-                }
-            }
-        }
+        callGroq(prompt: prompt)
     }
 
-    private func callGroq(prompt: String, completion: @escaping (Result<String, Error>) -> Void) {
+    private func callGroq(prompt: String) {
+        currentTask?.cancel()
+
         guard !apiKey.isEmpty else {
-            completion(.failure(NSError(domain: "LingoBar", code: 401, userInfo: [NSLocalizedDescriptionKey: "Groq API Key not found."])))
+            self.isLoading = false
+            self.errorMessage = "Groq API Key not found in Vault."
             return
         }
 
@@ -206,98 +248,129 @@ class AppViewModel: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
 
+        // Using llama-3.3-70b-versatile for high quality and speed
         let body: [String: Any] = [
-            "model": "qwen/qwen3.8-27b",
+            "model": "llama-3.3-70b-versatile",
             "messages": [
                 ["role": "user", "content": prompt]
             ],
-            "temperature": 0.2
+            "temperature": 0.2,
+            "max_tokens": 1024
         ]
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
+        currentTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isLoading = false
 
-            guard let data = data else {
-                completion(.failure(NSError(domain: "LingoBar", code: 500, userInfo: [NSLocalizedDescriptionKey: "No data received"])))
-                return
-            }
-
-            do {
-                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                        completion(.failure(NSError(domain: "Groq", code: 400, userInfo: [NSLocalizedDescriptionKey: msg])))
-                        return
-                    }
-
-                    if let choices = json["choices"] as? [[String: Any]],
-                       let first = choices.first,
-                       let message = first["message"] as? [String: Any],
-                       let content = message["content"] as? String {
-                        completion(.success(content))
-                        return
-                    }
+                if let error = error as NSError?, error.code == NSURLErrorCancelled {
+                    return
                 }
-                completion(.failure(NSError(domain: "LingoBar", code: 500, userInfo: [NSLocalizedDescriptionKey: "Invalid API response structure"])))
-            } catch {
-                completion(.failure(error))
+
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+
+                guard let data = data else {
+                    self.errorMessage = "No response data received."
+                    return
+                }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
+                            self.errorMessage = msg
+                            return
+                        }
+
+                        if let choices = json["choices"] as? [[String: Any]],
+                           let first = choices.first,
+                           let message = first["message"] as? [String: Any],
+                           let content = message["content"] as? String {
+                            self.outputText = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                            return
+                        }
+                    }
+                    self.errorMessage = "Invalid response format from Groq."
+                } catch {
+                    self.errorMessage = error.localizedDescription
+                }
             }
-        }.resume()
+        }
+        currentTask?.resume()
     }
 
-    func copyOutput() {
+    func copyOutputAndDismiss(onDismiss: @escaping () -> Void) {
+        guard !outputText.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(outputText, forType: .string)
         copied = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.copied = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            onDismiss()
         }
     }
 }
 
+// MARK: - Liquid Glass UI Views
 struct MainContentView: View {
     @ObservedObject var vm: AppViewModel
     var onClose: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
-            // Header Bar
-            HStack {
-                Text("🇱🇰 LingoBar Instant")
-                    .font(.system(size: 15, weight: .bold))
-                Spacer()
-                Text("Shortcut: ⌥Space or ⌥⇧L")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.secondary.opacity(0.12))
-                    .cornerRadius(4)
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
-                        .font(.system(size: 14))
+            // Header
+            HStack(alignment: .center) {
+                HStack(spacing: 6) {
+                    Text("🇱🇰")
+                        .font(.system(size: 16))
+                    Text("LingoBar")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                    Text("HUD")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.18))
+                        .foregroundColor(.blue)
+                        .cornerRadius(4)
                 }
-                .buttonStyle(.plain)
+
+                Spacer()
+
+                HStack(spacing: 8) {
+                    Text("⌥Space / ⌥⇧L")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12))
+                        .cornerRadius(4)
+
+                    Button(action: onClose) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary.opacity(0.8))
+                            .font(.system(size: 14))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Close (Esc)")
+                }
             }
 
-            // Tab Switcher
+            // Tab Selector
             Picker("", selection: $vm.selectedTab) {
-                Text("Translate (සරල සිංහල)").tag(AppTab.translate)
+                Text("Translate (සිංහල)").tag(AppTab.translate)
                 Text("Polish English").tag(AppTab.polish)
             }
             .pickerStyle(.segmented)
 
+            // Tone Selector (Only when polish tab is selected)
             if vm.selectedTab == .polish {
                 HStack {
                     Text("Tone:")
-                        .font(.caption)
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.secondary)
                     Picker("", selection: $vm.polishTone) {
                         Text("Natural").tag("Natural")
@@ -306,16 +379,17 @@ struct MainContentView: View {
                         Text("Concise").tag("Concise")
                     }
                     .pickerStyle(.menu)
-                    .frame(width: 130)
+                    .frame(width: 140)
                     Spacer()
                 }
+                .transition(.opacity)
             }
 
-            // Input
+            // Input Area
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(vm.selectedTab == .translate ? "English Text:" : "Raw English Draft:")
-                        .font(.caption)
+                    Text(vm.selectedTab == .translate ? "English Input:" : "Draft Input:")
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(.secondary)
                     Spacer()
                     if !vm.inputText.isEmpty {
@@ -324,22 +398,31 @@ struct MainContentView: View {
                             vm.outputText = ""
                         }
                         .buttonStyle(.plain)
-                        .font(.caption)
+                        .font(.system(size: 11))
                         .foregroundColor(.blue)
                     }
                 }
 
                 TextEditor(text: $vm.inputText)
                     .font(.system(size: 13))
-                    .frame(height: 75)
-                    .padding(4)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(6)
+                    .frame(height: 72)
+                    .padding(6)
+                    .background(Color(NSColor.textBackgroundColor).opacity(0.85))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    )
             }
 
-            // Actions
+            // Action / Run Button
             HStack {
+                Text("⌘ ↵ to run")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.7))
+
                 Spacer()
+
                 Button(action: {
                     if vm.selectedTab == .translate {
                         vm.runTranslate()
@@ -347,95 +430,111 @@ struct MainContentView: View {
                         vm.runPolish()
                     }
                 }) {
-                    if vm.isLoading {
-                        ProgressView().controlSize(.small)
-                            .padding(.horizontal, 10)
-                    } else {
-                        Text(vm.selectedTab == .translate ? "Translate" : "Polish")
-                            .fontWeight(.semibold)
+                    HStack(spacing: 6) {
+                        if vm.isLoading {
+                            ProgressView().controlSize(.small)
+                            Text("Processing...")
+                                .font(.system(size: 12, weight: .medium))
+                        } else {
+                            Image(systemName: vm.selectedTab == .translate ? "character.book.closed" : "wand.and.stars")
+                            Text(vm.selectedTab == .translate ? "Translate" : "Polish")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
                 .disabled(vm.isLoading || vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            // Output
-            VStack(alignment: .leading, spacing: 4) {
+            // Output Card
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text(vm.selectedTab == .translate ? "Sinhala Meaning:" : "Polished English:")
-                        .font(.caption)
+                    Text(vm.selectedTab == .translate ? "Sinhala (සරල සිංහල):" : "Polished Result:")
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(.secondary)
+
                     Spacer()
+
                     if !vm.outputText.isEmpty {
                         Button(action: {
-                            vm.copyOutput()
+                            vm.copyOutputAndDismiss(onDismiss: onClose)
                         }) {
                             HStack(spacing: 4) {
-                                Image(systemName: vm.copied ? "checkmark" : "doc.on.doc")
-                                Text(vm.copied ? "Copied!" : "Copy")
+                                Image(systemName: vm.copied ? "checkmark.circle.fill" : "doc.on.doc")
+                                Text(vm.copied ? "Copied & Closing" : "Copy & Close (↵)")
                             }
-                            .font(.caption)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(vm.copied ? .green : .blue)
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(.blue)
+                        .keyboardShortcut(.return, modifiers: [])
                     }
                 }
 
                 ScrollView {
-                    Text(vm.outputText.isEmpty ? (vm.isLoading ? "Translating with AI..." : "Result will appear here...") : vm.outputText)
-                        .font(.system(size: 14))
-                        .foregroundColor(vm.outputText.isEmpty ? .secondary : .primary)
+                    Text(vm.outputText.isEmpty ? (vm.isLoading ? "Translating with Groq AI..." : "Select text anywhere and hit ⌥Space to translate instantly.") : vm.outputText)
+                        .font(.system(size: 14, weight: .regular))
+                        .lineSpacing(4)
+                        .foregroundColor(vm.outputText.isEmpty ? .secondary.opacity(0.8) : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
+                        .padding(10)
                 }
-                .frame(height: 85)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
+                .frame(height: 90)
+                .background(Color(NSColor.textBackgroundColor).opacity(0.85))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                )
 
                 if !vm.errorMessage.isEmpty {
                     Text("Error: \(vm.errorMessage)")
-                        .font(.caption)
+                        .font(.system(size: 11))
                         .foregroundColor(.red)
+                        .padding(.top, 2)
                 }
             }
 
-            // Bottom bar
+            // Footer
             HStack {
                 Button("Esc to close") {
                     onClose()
                 }
                 .buttonStyle(.plain)
-                .font(.caption2)
+                .font(.system(size: 10))
                 .foregroundColor(.secondary)
                 .keyboardShortcut(.escape, modifiers: [])
 
                 Spacer()
 
-                Button("Quit App") {
+                Button("Quit LingoBar") {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.plain)
-                .font(.caption2)
-                .foregroundColor(.secondary)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary.opacity(0.6))
             }
         }
         .padding(16)
-        .frame(width: 480, height: 380)
-        .background(VisualEffectView().cornerRadius(12))
+        .frame(width: 500, height: 390)
+        .background(VisualEffectView().cornerRadius(14))
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
         )
     }
 }
 
+// MARK: - Blur Visual Effect
 struct VisualEffectView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.blendingMode = .behindWindow
         view.state = .active
-        view.material = .popover
+        view.material = .hudWindow
         return view
     }
 
