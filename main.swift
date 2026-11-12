@@ -1038,10 +1038,7 @@ struct InlinePopoverView: View {
                         }
 
                     Button(action: {
-                        if let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
-                            vm.inputText = clip
-                            vm.runTranslate()
-                        }
+                        pasteAndTranslate()
                     }) {
                         HStack(spacing: 3) {
                             Image(systemName: "doc.on.clipboard")
@@ -1158,6 +1155,17 @@ struct InlinePopoverView: View {
         .onAppear {
             vm.isAccessibilityTrusted = AXIsProcessTrustedWithOptions(nil)
         }
+    }
+
+    private func pasteAndTranslate() {
+        guard let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty else {
+            NSSound.beep()
+            vm.errorMessage = "Clipboard is empty or contains no text"
+            return
+        }
+        vm.errorMessage = ""
+        vm.inputText = clip
+        vm.runTranslate()
     }
 }
 
