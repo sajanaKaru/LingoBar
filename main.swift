@@ -535,18 +535,19 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         streamDataBuffer.append(data)
 
         let maxStreamBufferSize = 128 * 1024 // 128KB
-        if streamDataBuffer.count > maxStreamBufferSize && !streamDataBuffer.contains(0x0A) {
-            dataTask.cancel()
-            self.errorMessage = "Stream exceeded buffer limit without delimiters."
-            self.isLoading = false
-            self.streamDataBuffer.removeAll()
-            return
-        }
-
         let newlineByte: UInt8 = 0x0A // \n
         while let newlineIndex = streamDataBuffer.firstIndex(of: newlineByte) {
             let lineData = streamDataBuffer.subdata(in: 0..<newlineIndex)
             streamDataBuffer.removeSubrange(0...newlineIndex)
+
+            // Check individual line size limit before decoding
+            if lineData.count > maxStreamBufferSize {
+                dataTask.cancel()
+                self.errorMessage = "Line exceeded maximum allowed size."
+                self.isLoading = false
+                self.streamDataBuffer.removeAll()
+                return
+            }
 
             // Safely decode the completed line chunk
             guard let lineStr = String(data: lineData, encoding: .utf8) else {
@@ -555,6 +556,15 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             }
 
             processSSELine(lineStr)
+        }
+
+        // Check remaining tail buffer size after draining all complete lines
+        if streamDataBuffer.count > maxStreamBufferSize {
+            dataTask.cancel()
+            self.errorMessage = "Stream buffer tail exceeded maximum allowed size."
+            self.isLoading = false
+            self.streamDataBuffer.removeAll()
+            return
         }
     }
 
