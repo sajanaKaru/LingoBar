@@ -364,7 +364,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 1. Check Accessibility permissions and capture selected text
-        let isTrusted = AXIsProcessTrusted()
+        let isTrusted = AXIsProcessTrustedWithOptions(nil)
         viewModel.isAccessibilityTrusted = isTrusted
 
         let captureResult = captureSelectedTextAndBounds()
@@ -463,6 +463,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var calculatedBounds: NSRect? = nil
 
         if let elem = focusedElement {
+            // Strategy A: Direct kAXSelectedTextAttribute
             var selectedTextValue: AnyObject?
             if AXUIElementCopyAttributeValue(elem, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success,
                let text = selectedTextValue as? String {
@@ -472,15 +473,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Extract bounds from AX if available
+            // Strategy B: kAXSelectedTextRangeAttribute + kAXStringForRangeParameterizedAttribute / kAXValueAttribute
             var selectedRangeVal: AnyObject?
             let rangeResult = AXUIElementCopyAttributeValue(elem, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
             if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
+                let axRange = rangeAX as! AXValue
+
+                // B1: Parameterized string for range (Safari, WebKit, Pages, TextEdit)
+                if selectedText == nil {
+                    var strVal: AnyObject?
+                    let strResult = AXUIElementCopyParameterizedAttributeValue(
+                        elem,
+                        kAXStringForRangeParameterizedAttribute as CFString,
+                        axRange,
+                        &strVal
+                    )
+                    if strResult == .success, let text = strVal as? String {
+                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            selectedText = trimmed
+                        }
+                    }
+                }
+
+                // B2: Full string from kAXValueAttribute sliced by CFRange (Chrome, TextFields, Electron)
+                if selectedText == nil {
+                    var cfRange = CFRange()
+                    if AXValueGetValue(axRange, .cfRange, &cfRange) && cfRange.length > 0 {
+                        var valAttr: AnyObject?
+                        if AXUIElementCopyAttributeValue(elem, kAXValueAttribute as CFString, &valAttr) == .success {
+                            let rawString = (valAttr as? String) ?? ((valAttr as? NSAttributedString)?.string)
+                            if let fullText = rawString {
+                                let nsString = fullText as NSString
+                                if cfRange.location >= 0 && cfRange.location + cfRange.length <= nsString.length {
+                                    let sub = nsString.substring(with: NSRange(location: cfRange.location, length: cfRange.length))
+                                    let trimmed = sub.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if !trimmed.isEmpty {
+                                        selectedText = trimmed
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Extract bounds from AX if available
                 var boundsVal: AnyObject?
                 let boundsResult = AXUIElementCopyParameterizedAttributeValue(
                     elem,
                     kAXBoundsForRangeParameterizedAttribute as CFString,
-                    rangeAX as! AXValue,
+                    axRange,
                     &boundsVal
                 )
                 if boundsResult == .success, let bVal = boundsVal, CFGetTypeID(bVal) == AXValueGetTypeID() {
@@ -492,9 +534,77 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+
+            // Strategy C: Check parent hierarchy if text still not found (common in web views / compound controls)
+            if selectedText == nil {
+                var currentElem = elem
+                for _ in 0..<3 {
+                    var parentVal: AnyObject?
+                    if AXUIElementCopyAttributeValue(currentElem, kAXParentAttribute as CFString, &parentVal) == .success,
+                       let parent = parentVal {
+                        let parentElem = parent as! AXUIElement
+                        var parentTextVal: AnyObject?
+                        if AXUIElementCopyAttributeValue(parentElem, kAXSelectedTextAttribute as CFString, &parentTextVal) == .success,
+                           let text = parentTextVal as? String {
+                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty {
+                                selectedText = trimmed
+                                break
+                            }
+                        }
+                        currentElem = parentElem
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+
+        // Strategy D: Universal Synthetic Cmd+C Copy Fallback (for Chrome, Slack, Notes, VS Code, Electron)
+        if selectedText == nil || selectedText!.isEmpty {
+            if let copied = copySelectedTextViaSyntheticCommandC() {
+                selectedText = copied
+            }
         }
 
         return (selectedText, calculatedBounds ?? fallbackRect)
+    }
+
+    /// Universal fallback: simulates Cmd+C to capture highlighted text when Accessibility APIs do not expose selection.
+    private func copySelectedTextViaSyntheticCommandC() -> String? {
+        let pasteboard = NSPasteboard.general
+        let initialChangeCount = pasteboard.changeCount
+
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let cKeyCode: CGKeyCode = 8 // kVK_ANSI_C
+
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: false) else {
+            return nil
+        }
+
+        keyDown.flags = .maskCommand
+        keyUp.flags = []
+
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+
+        // Poll pasteboard for up to 150ms (15 iterations x 10ms)
+        var copiedString: String? = nil
+        for _ in 0..<15 {
+            usleep(10_000)
+            if pasteboard.changeCount != initialChangeCount {
+                if let str = pasteboard.string(forType: .string) {
+                    let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        copiedString = trimmed
+                    }
+                }
+                break
+            }
+        }
+
+        return copiedString
     }
 }
 
@@ -893,8 +1003,13 @@ struct InlinePopoverView: View {
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundColor(.orange)
                         Button("Open Privacy & Security > Accessibility") {
+                            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                            _ = AXIsProcessTrustedWithOptions(options)
                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                                 NSWorkspace.shared.open(url)
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                                vm.isAccessibilityTrusted = AXIsProcessTrustedWithOptions(nil)
                             }
                         }
                         .buttonStyle(.plain)
@@ -1034,6 +1149,9 @@ struct InlinePopoverView: View {
                 .stroke(Color.white.opacity(0.2), lineWidth: 1)
         )
         .shadow(color: Color.black.opacity(0.18), radius: 10, x: 0, y: 5)
+        .onAppear {
+            vm.isAccessibilityTrusted = AXIsProcessTrustedWithOptions(nil)
+        }
     }
 }
 
