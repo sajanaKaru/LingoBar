@@ -518,9 +518,14 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             return
         }
 
-        // If non-2xx status, accumulate complete error response body
+        // If non-2xx status, accumulate complete error response body (capped at 64KB)
         if !(200...299).contains(responseStatusCode) {
-            errorDataBuffer.append(data)
+            let maxErrorBufferSize = 64 * 1024
+            if errorDataBuffer.count < maxErrorBufferSize {
+                let remainingSpace = maxErrorBufferSize - errorDataBuffer.count
+                let slice = data.prefix(remainingSpace)
+                errorDataBuffer.append(slice)
+            }
             return
         }
 
@@ -534,6 +539,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
             // Safely decode the completed line chunk
             guard let lineStr = String(data: lineData, encoding: .utf8) else {
+                self.hadStreamParseError = true
                 continue
             }
 
@@ -608,6 +614,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         if !streamDataBuffer.isEmpty {
             if let trailingStr = String(data: streamDataBuffer, encoding: .utf8) {
                 processSSELine(trailingStr)
+            } else {
+                self.hadStreamParseError = true
             }
             streamDataBuffer.removeAll()
         }
