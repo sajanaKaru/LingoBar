@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Carbon
+import Combine
 
 // MARK: - App Entry Point
 @main
@@ -107,80 +108,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         viewModel.copied = false
 
-        // Capture highlighted text with safe clipboard preservation
-        captureSelectedText { [weak self] capturedText in
-            guard let self = self else { return }
-            let text = capturedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty {
-                self.viewModel.inputText = text
-                self.viewModel.runTranslate()
-            }
-            self.panel.center()
-            self.panel.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+        // Strictly capture selected text via Accessibility API (no clipboard fallback)
+        if let axText = captureSelectedTextViaAccessibility(), !axText.isEmpty {
+            viewModel.inputText = axText
+            viewModel.runTranslate()
+        } else {
+            // Clean empty state when no text selected or AX is unavailable
+            viewModel.inputText = ""
+            viewModel.outputText = ""
+            viewModel.warningMessage = ""
+            viewModel.errorMessage = ""
         }
+
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Captures selected text via Accessibility API if available, or simulated Cmd+C with strict clipboard preservation
-    private func captureSelectedText(completion: @escaping (String) -> Void) {
-        // 1. Accessibility API First (Zero clipboard impact, 100% provenance)
-        if let axText = getSelectedTextViaAccessibility(), !axText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            completion(axText)
-            return
-        }
-
-        // 2. Safe Fallback: Capture pasteboard items snapshot before synthetic copy
-        let pasteboard = NSPasteboard.general
-        let initialChangeCount = pasteboard.changeCount
-
-        // Backup existing pasteboard items
-        var savedItems: [[NSPasteboard.PasteboardType: Data]] = []
-        let hadItems = (pasteboard.pasteboardItems?.isEmpty == false)
-
-        if let items = pasteboard.pasteboardItems {
-            for item in items {
-                var itemDict: [NSPasteboard.PasteboardType: Data] = [:]
-                for type in item.types {
-                    if let data = item.data(forType: type) {
-                        itemDict[type] = data
-                    }
-                }
-                if !itemDict.isEmpty {
-                    savedItems.append(itemDict)
-                }
-            }
-        }
-
-        simulateCopy()
-
-        // Wait 90ms for simulated copy event to register
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
-            var capturedText = ""
-            // Ensure changeCount strictly incremented by exactly 1, proving our synthetic copy occurred
-            if pasteboard.changeCount == initialChangeCount + 1 {
-                capturedText = pasteboard.string(forType: .string) ?? ""
-            }
-
-            // Restore previous pasteboard contents faithfully
-            if hadItems && !savedItems.isEmpty {
-                pasteboard.clearContents()
-                for itemDict in savedItems {
-                    let pbItem = NSPasteboardItem()
-                    for (type, data) in itemDict {
-                        pbItem.setData(data, forType: type)
-                    }
-                    pasteboard.writeObjects([pbItem])
-                }
-            } else if !hadItems {
-                // If pasteboard was originally empty, restore it to empty
-                pasteboard.clearContents()
-            }
-
-            completion(capturedText)
-        }
-    }
-
-    private func getSelectedTextViaAccessibility() -> String? {
+    /// Captures selected text strictly via macOS Accessibility API without touching the system clipboard
+    private func captureSelectedTextViaAccessibility() -> String? {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedApp: AnyObject?
         let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
@@ -194,18 +140,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let textResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedTextValue)
         guard textResult == .success, let text = selectedTextValue as? String else { return nil }
 
-        return text
-    }
-
-    private func simulateCopy() {
-        let src = CGEventSource(stateID: .hidSystemState)
-        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true) // 'c'
-        keyDown?.flags = .maskCommand
-        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
-        keyUp?.flags = .maskCommand
-
-        keyDown?.post(tap: .cghidEventTap)
-        keyUp?.post(tap: .cghidEventTap)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -380,6 +316,7 @@ class AppViewModel: ObservableObject {
 struct MainContentView: View {
     @ObservedObject var vm: AppViewModel
     var onClose: () -> Void
+    @FocusState private var isInputFocused: Bool
 
     var body: some View {
         VStack(spacing: 12) {
@@ -476,6 +413,7 @@ struct MainContentView: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                     )
+                    .focused($isInputFocused)
             }
 
             // Action / Run Button
@@ -599,6 +537,20 @@ struct MainContentView: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(Color.white.opacity(0.18), lineWidth: 1)
         )
+        .onAppear {
+            if vm.inputText.isEmpty {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isInputFocused = true
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            if vm.inputText.isEmpty {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    isInputFocused = true
+                }
+            }
+        }
     }
 }
 
