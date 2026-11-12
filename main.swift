@@ -508,6 +508,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 // 2xx status but not streaming response: cancel task immediately to stop data receipt
                 self.errorMessage = "Groq API error: Unexpected non-streaming response."
                 self.isLoading = false
+                self.currentRequestId = UUID()
+                self.streamDataBuffer.removeAll()
+                self.errorDataBuffer.removeAll()
                 completionHandler(.cancel)
                 return
             }
@@ -543,6 +546,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             // Check individual line size limit before decoding
             if lineData.count > maxStreamBufferSize {
                 dataTask.cancel()
+                self.currentRequestId = UUID()
                 self.errorMessage = "Line exceeded maximum allowed size."
                 self.isLoading = false
                 self.streamDataBuffer.removeAll()
@@ -561,6 +565,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         // Check remaining tail buffer size after draining all complete lines
         if streamDataBuffer.count > maxStreamBufferSize {
             dataTask.cancel()
+            self.currentRequestId = UUID()
             self.errorMessage = "Stream buffer tail exceeded maximum allowed size."
             self.isLoading = false
             self.streamDataBuffer.removeAll()
