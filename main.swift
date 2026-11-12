@@ -55,6 +55,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var globalMouseDownMonitor: Any?
     private var globalScrollMonitor: Any?
     private var hostingController: NSHostingController<InlinePopoverView>?
+    private var cancellables = Set<AnyCancellable>()
+    private var currentAnchorRect: NSRect?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let popoverView = InlinePopoverView(
@@ -67,7 +69,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hc = NSHostingController(rootView: popoverView)
         self.hostingController = hc
 
-        panel = InlinePopoverPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 180))
+        panel = InlinePopoverPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 140))
         panel.contentViewController = hc
 
         // Menu Bar Companion
@@ -82,6 +84,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupMonitors()
+        observeContentFittingSize()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        teardownMonitors()
+        viewModel.cleanup()
     }
 
     @objc func triggerFromMenu() {
@@ -137,9 +145,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func teardownMonitors() {
+        if let gkm = globalKeyDownMonitor {
+            NSEvent.removeMonitor(gkm)
+            globalKeyDownMonitor = nil
+        }
+        if let lkm = localKeyDownMonitor {
+            NSEvent.removeMonitor(lkm)
+            localKeyDownMonitor = nil
+        }
+        if let gmm = globalMouseDownMonitor {
+            NSEvent.removeMonitor(gmm)
+            globalMouseDownMonitor = nil
+        }
+        if let gsm = globalScrollMonitor {
+            NSEvent.removeMonitor(gsm)
+            globalScrollMonitor = nil
+        }
+    }
+
+    private func observeContentFittingSize() {
+        // Dynamically adjust popover frame height smoothly as content streams in
+        viewModel.$outputText
+            .debounce(for: .milliseconds(50), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
+
+        viewModel.$errorMessage
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
+
+        viewModel.$isTruncated
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func updatePopoverSize() {
+        guard panel.isVisible, let hc = hostingController, let anchor = currentAnchorRect else { return }
+        let fitting = hc.sizeThatFits(in: CGSize(width: 340, height: 320))
+        let targetHeight = min(max(fitting.height, 120), 280)
+        let newSize = NSSize(width: 340, height: targetHeight)
+        
+        if abs(panel.frame.height - newSize.height) > 2 {
+            positionPanel(anchoredTo: anchor, desiredHeight: newSize.height)
+        }
+    }
+
     func dismissPopover() {
         guard panel.isVisible else { return }
         panel.orderOut(nil)
+        currentAnchorRect = nil
         viewModel.resetToEmptyState()
     }
 
@@ -152,17 +213,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 1. Capture selected text and its bounding box strictly via Accessibility API
         let captureResult = captureSelectedTextAndBounds()
         guard let text = captureResult.text, !text.isEmpty else {
-            // If no text is selected, do not present a detached empty box
             NSSound.beep()
             return
         }
 
         viewModel.resetToEmptyState()
         viewModel.inputText = text
+        currentAnchorRect = captureResult.bounds
 
-        // 2. Compute anchor position
-        let anchorRect = captureResult.bounds
-        positionPanel(anchoredTo: anchorRect)
+        // 2. Initial position
+        positionPanel(anchoredTo: captureResult.bounds, desiredHeight: 140)
 
         // 3. Show non-activating panel (preserves user selection highlight and active app)
         panel.orderFrontRegardless()
@@ -172,18 +232,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Positions the popover panel above or below the selection bounds clamped to the current screen
-    private func positionPanel(anchoredTo targetRect: NSRect) {
+    private func positionPanel(anchoredTo targetRect: NSRect, desiredHeight: CGFloat) {
         guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(targetRect) }) ?? NSScreen.main else {
             return
         }
 
         let visibleFrame = screen.visibleFrame
-        let panelSize = panel.frame.size
+        let panelWidth: CGFloat = 340
+        let panelHeight: CGFloat = desiredHeight
         let margin: CGFloat = 8
 
         // Try placing below selection first
-        var originX = targetRect.origin.x + (targetRect.width - panelSize.width) / 2.0
-        var originY = targetRect.origin.y - panelSize.height - margin
+        var originX = targetRect.origin.x + (targetRect.width - panelWidth) / 2.0
+        var originY = targetRect.origin.y - panelHeight - margin
 
         // If below screen bottom edge, place above the selection
         if originY < visibleFrame.minY {
@@ -193,19 +254,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Horizontal clamping within visible screen bounds
         if originX < visibleFrame.minX + margin {
             originX = visibleFrame.minX + margin
-        } else if originX + panelSize.width > visibleFrame.maxX - margin {
-            originX = visibleFrame.maxX - panelSize.width - margin
+        } else if originX + panelWidth > visibleFrame.maxX - margin {
+            originX = visibleFrame.maxX - panelWidth - margin
         }
 
         // Vertical clamping
-        if originY + panelSize.height > visibleFrame.maxY - margin {
-            originY = visibleFrame.maxY - panelSize.height - margin
+        if originY + panelHeight > visibleFrame.maxY - margin {
+            originY = visibleFrame.maxY - panelHeight - margin
         }
         if originY < visibleFrame.minY + margin {
             originY = visibleFrame.minY + margin
         }
 
-        panel.setFrameOrigin(NSPoint(x: round(originX), y: round(originY)))
+        panel.setFrame(NSRect(x: round(originX), y: round(originY), width: panelWidth, height: panelHeight), display: true, animate: false)
     }
 
     /// Captures selected text and converts its AX screen bounds to AppKit desktop coordinates
@@ -267,19 +328,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Popover View Model with Fast Streaming Groq Engine
+// MARK: - Popover View Model with Robust Multibyte UTF-8 Streaming & Error Handling
 class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var inputText: String = ""
     @Published var outputText: String = ""
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
     @Published var copied: Bool = false
+    @Published var isTruncated: Bool = false
 
     private let apiKey: String
     private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
-    private var streamBuffer: String = ""
+    private var streamDataBuffer = Data()
     private var dismissWorkItem: DispatchWorkItem?
 
     override init() {
@@ -292,8 +354,13 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         super.init()
 
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15.0
+        config.timeoutIntervalForRequest = 20.0
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
+    }
+
+    func cleanup() {
+        resetToEmptyState()
+        session?.invalidateAndCancel()
     }
 
     func resetToEmptyState() {
@@ -302,12 +369,13 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         currentTask?.cancel()
         currentTask = nil
         currentRequestId = UUID()
-        streamBuffer = ""
+        streamDataBuffer.removeAll()
         isLoading = false
         inputText = ""
         outputText = ""
         errorMessage = ""
         copied = false
+        isTruncated = false
     }
 
     func runTranslate() {
@@ -322,17 +390,18 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         errorMessage = ""
         outputText = ""
         copied = false
-        streamBuffer = ""
+        isTruncated = false
+        streamDataBuffer.removeAll()
 
         guard !apiKey.isEmpty else {
             self.isLoading = false
-            self.errorMessage = "Groq API Key not found."
+            self.errorMessage = "Groq API Key not found in Vault."
             return
         }
 
         guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
             self.isLoading = false
-            self.errorMessage = "Invalid API URL."
+            self.errorMessage = "Invalid API endpoint URL."
             return
         }
 
@@ -386,41 +455,84 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
     }
 
-    // MARK: - URLSessionDataDelegate (Streaming SSE Chunks)
+    // MARK: - URLSessionDataDelegate (HTTP Status & Multibyte UTF-8 SSE Streaming)
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let taskDesc = dataTask.taskDescription, taskDesc == currentRequestId.uuidString else {
+            completionHandler(.cancel)
+            return
+        }
+
+        if let httpResponse = response as? HTTPURLResponse {
+            if httpResponse.statusCode != 200 {
+                // Non-200 HTTP error (e.g. 401 Unauthorized, 429 Rate Limit, 500 Server Error)
+                self.isLoading = false
+                let code = httpResponse.statusCode
+                switch code {
+                case 401:
+                    self.errorMessage = "Groq API error (401): Invalid or unauthorized API key."
+                case 429:
+                    self.errorMessage = "Groq API error (429): Rate limit exceeded. Try again shortly."
+                default:
+                    self.errorMessage = "Groq API error (\(code)): Unable to complete translation."
+                }
+            }
+        }
+        completionHandler(.allow)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let taskDesc = dataTask.taskDescription, taskDesc == currentRequestId.uuidString else {
             return
         }
 
-        guard let chunk = String(data: data, encoding: .utf8) else { return }
-        streamBuffer.append(chunk)
+        // Multibyte-safe UTF-8 buffering: accumulate bytes and only decode complete lines at '\n'
+        streamDataBuffer.append(data)
 
-        var lines = streamBuffer.components(separatedBy: "\n")
-        streamBuffer = lines.removeLast() // Keep remainder in buffer
+        let newlineByte: UInt8 = 0x0A // \n
+        while let newlineIndex = streamDataBuffer.firstIndex(of: newlineByte) {
+            let lineData = streamDataBuffer.subdata(in: 0..<newlineIndex)
+            streamDataBuffer.removeSubrange(0...newlineIndex)
 
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
-            if trimmed == "data: [DONE]" {
-                self.isLoading = false
+            // Safely decode the completed line chunk
+            guard let lineStr = String(data: lineData, encoding: .utf8) else {
                 continue
             }
-            if trimmed.hasPrefix("data: ") {
-                let jsonStr = String(trimmed.dropFirst(6))
-                if let jsonData = jsonStr.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
-                    if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                        self.errorMessage = msg
-                        self.isLoading = false
-                        return
-                    }
 
-                    if let choices = json["choices"] as? [[String: Any]],
-                       let first = choices.first,
-                       let delta = first["delta"] as? [String: Any],
-                       let content = delta["content"] as? String {
-                        self.outputText.append(content)
-                    }
+            processSSELine(lineStr)
+        }
+    }
+
+    private func processSSELine(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.hasPrefix(":") { return }
+
+        if trimmed == "data: [DONE]" {
+            self.isLoading = false
+            return
+        }
+
+        if trimmed.hasPrefix("data: ") {
+            let jsonStr = String(trimmed.dropFirst(6))
+            guard let jsonData = jsonStr.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                return
+            }
+
+            // Check for API-level error returned within stream
+            if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
+                self.errorMessage = msg
+                self.isLoading = false
+                return
+            }
+
+            if let choices = json["choices"] as? [[String: Any]], let first = choices.first {
+                if let finishReason = first["finish_reason"] as? String, finishReason == "length" {
+                    self.isTruncated = true
+                }
+
+                if let delta = first["delta"] as? [String: Any],
+                   let content = delta["content"] as? String {
+                    self.outputText.append(content)
                 }
             }
         }
@@ -438,26 +550,17 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             self.errorMessage = error.localizedDescription
         }
 
-        // Flush any remaining content in streamBuffer
-        if !streamBuffer.isEmpty {
-            let trimmed = streamBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("data: ") && trimmed != "data: [DONE]" {
-                let jsonStr = String(trimmed.dropFirst(6))
-                if let jsonData = jsonStr.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                   let choices = json["choices"] as? [[String: Any]],
-                   let first = choices.first,
-                   let delta = first["delta"] as? [String: Any],
-                   let content = delta["content"] as? String {
-                    self.outputText.append(content)
-                }
+        // Flush any trailing line in buffer
+        if !streamDataBuffer.isEmpty {
+            if let trailingStr = String(data: streamDataBuffer, encoding: .utf8) {
+                processSSELine(trailingStr)
             }
-            streamBuffer = ""
+            streamDataBuffer.removeAll()
         }
     }
 }
 
-// MARK: - Native Tooltip / Popover Bubble UI
+// MARK: - Native Tooltip / Popover Bubble UI with Dynamic Sizing & Scrollable Content
 struct InlinePopoverView: View {
     @ObservedObject var vm: PopoverViewModel
     var onClose: () -> Void
@@ -513,11 +616,11 @@ struct InlinePopoverView: View {
                 .help("Close (Esc)")
             }
 
-            // Translation Content
+            // Translation Content with Smooth ScrollView & Dynamic Clamped Height
             VStack(alignment: .leading, spacing: 4) {
                 if !vm.errorMessage.isEmpty {
                     Text(vm.errorMessage)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11.5))
                         .foregroundColor(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else if vm.outputText.isEmpty && vm.isLoading {
@@ -527,18 +630,34 @@ struct InlinePopoverView: View {
                         .italic()
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    Text(vm.outputText)
-                        .font(.system(size: 13.5, weight: .medium))
-                        .lineSpacing(3)
-                        .foregroundColor(.primary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ScrollView(.vertical, showsIndicators: true) {
+                        Text(vm.outputText)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .lineSpacing(3)
+                            .foregroundColor(.primary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                    }
+                    .frame(maxHeight: 200)
                 }
             }
             .contentShape(Rectangle())
             .onTapGesture {
                 if !vm.outputText.isEmpty {
                     vm.copyAndDismiss(onDismiss: onClose)
+                }
+            }
+
+            // Truncation Warning Banner (if hit length limit)
+            if vm.isTruncated {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 9.5))
+                    Text("Output truncated due to token limit")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.orange)
                 }
             }
 
