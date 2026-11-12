@@ -184,6 +184,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updatePopoverSize()
             }
             .store(in: &cancellables)
+
+        viewModel.$hadStreamParseError
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
     }
 
     private func updatePopoverSize() {
@@ -336,12 +342,14 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var errorMessage: String = ""
     @Published var copied: Bool = false
     @Published var isTruncated: Bool = false
+    @Published var hadStreamParseError: Bool = false
 
     private let apiKey: String
     private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
     private var streamDataBuffer = Data()
+    private var errorDataBuffer = Data()
     private var dismissWorkItem: DispatchWorkItem?
     private var responseStatusCode: Int = 200
     private var isEventStream: Bool = false
@@ -373,9 +381,11 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         currentTask = nil
         currentRequestId = UUID()
         streamDataBuffer.removeAll()
+        errorDataBuffer.removeAll()
         responseStatusCode = 200
         isEventStream = false
         receivedDone = false
+        hadStreamParseError = false
         isLoading = false
         inputText = ""
         outputText = ""
@@ -397,10 +407,12 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         outputText = ""
         copied = false
         isTruncated = false
+        hadStreamParseError = false
         responseStatusCode = 200
         isEventStream = false
         receivedDone = false
         streamDataBuffer.removeAll()
+        errorDataBuffer.removeAll()
 
         guard !apiKey.isEmpty else {
             self.isLoading = false
@@ -506,13 +518,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             return
         }
 
-        // If non-2xx status, parse detailed JSON error message if provided by API
+        // If non-2xx status, accumulate complete error response body
         if !(200...299).contains(responseStatusCode) {
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errorObj = json["error"] as? [String: Any],
-               let msg = errorObj["message"] as? String {
-                self.errorMessage = "Groq API error (\(responseStatusCode)): \(msg)"
-            }
+            errorDataBuffer.append(data)
             return
         }
 
@@ -547,6 +555,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             let jsonStr = String(trimmed.dropFirst(6))
             guard let jsonData = jsonStr.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                self.hadStreamParseError = true
                 return
             }
 
@@ -580,6 +589,18 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         if let error = error as NSError? {
             if error.code == NSURLErrorCancelled { return }
             self.errorMessage = error.localizedDescription
+            return
+        }
+
+        // If non-2xx status, parse the accumulated complete JSON error body
+        if !(200...299).contains(responseStatusCode) {
+            if !errorDataBuffer.isEmpty,
+               let json = try? JSONSerialization.jsonObject(with: errorDataBuffer) as? [String: Any],
+               let errorObj = json["error"] as? [String: Any],
+               let msg = errorObj["message"] as? String {
+                self.errorMessage = "Groq API error (\(responseStatusCode)): \(msg)"
+            }
+            errorDataBuffer.removeAll()
             return
         }
 
@@ -700,6 +721,18 @@ struct InlinePopoverView: View {
                     Text("Output truncated due to token limit")
                         .font(.system(size: 9.5))
                         .foregroundColor(.orange)
+                }
+            }
+
+            // Stream Parse Warning Banner (if corrupt chunks encountered)
+            if vm.hadStreamParseError {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.yellow)
+                        .font(.system(size: 9.5))
+                    Text("Warning: Stream encountered malformed data")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.yellow)
                 }
             }
 
