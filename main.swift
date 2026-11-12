@@ -50,9 +50,10 @@ final class GlobalHotKeyManager {
         }
 
         let installStatus = InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandler)
-        if installStatus != noErr {
+        guard installStatus == noErr else {
             NSLog("[LingoBar] InstallEventHandler failed with status: %d", installStatus)
             hasRegistrationConflict = true
+            return false
         }
 
         // 1. Option + Space (kVK_Space = 49, optionKey = 0x0800)
@@ -79,7 +80,16 @@ final class GlobalHotKeyManager {
             hasRegistrationConflict = true
         }
 
-        return !hasRegistrationConflict
+        // If any hotkey registration failed, unregister any already registered hotkeys
+        if hasRegistrationConflict {
+            for ref in hotKeyRefs {
+                UnregisterEventHotKey(ref)
+            }
+            hotKeyRefs.removeAll()
+            return false
+        }
+
+        return true
     }
 
     func teardown() {
@@ -154,17 +164,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Menu Bar Companion
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem?.button {
-            button.title = "🇱🇰 LingoBar"
-            let menu = NSMenu()
-            menu.addItem(NSMenuItem(title: "Translate Selection (⌥Space)", action: #selector(triggerFromMenu), keyEquivalent: ""))
+        setupHotKeysAndMonitors()
+        updateMenuBarMenu()
+        observeContentFittingSize()
+    }
+
+    private func updateMenuBarMenu() {
+        guard let button = statusItem?.button else { return }
+        button.title = "🇱🇰 LingoBar"
+
+        let menu = NSMenu()
+        if !viewModel.hotKeyConflictMessage.isEmpty {
+            let conflictItem = NSMenuItem(title: "⚠️ Shortcut Conflict: Use Menu to Translate", action: nil, keyEquivalent: "")
+            conflictItem.isEnabled = false
+            menu.addItem(conflictItem)
             menu.addItem(NSMenuItem.separator())
-            menu.addItem(NSMenuItem(title: "Quit LingoBar", action: #selector(quitApp), keyEquivalent: "q"))
-            statusItem?.menu = menu
+            button.toolTip = "LingoBar: Shortcut conflict detected. Click to translate."
+        } else {
+            button.toolTip = "LingoBar (⌥Space to Translate Selection)"
         }
 
-        setupHotKeysAndMonitors()
-        observeContentFittingSize()
+        menu.addItem(NSMenuItem(title: "Translate Selection (⌥Space)", action: #selector(triggerFromMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit LingoBar", action: #selector(quitApp), keyEquivalent: "q"))
+        statusItem?.menu = menu
     }
 
     func applicationWillTerminate(_ notification: Notification) {
