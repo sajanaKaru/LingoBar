@@ -343,6 +343,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     private var currentRequestId: UUID = UUID()
     private var streamDataBuffer = Data()
     private var dismissWorkItem: DispatchWorkItem?
+    private var responseStatusCode: Int = 200
+    private var isEventStream: Bool = false
+    private var receivedDone: Bool = false
 
     override init() {
         let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
@@ -370,6 +373,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         currentTask = nil
         currentRequestId = UUID()
         streamDataBuffer.removeAll()
+        responseStatusCode = 200
+        isEventStream = false
+        receivedDone = false
         isLoading = false
         inputText = ""
         outputText = ""
@@ -391,6 +397,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         outputText = ""
         copied = false
         isTruncated = false
+        responseStatusCode = 200
+        isEventStream = false
+        receivedDone = false
         streamDataBuffer.removeAll()
 
         guard !apiKey.isEmpty else {
@@ -463,10 +472,18 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         }
 
         if let httpResponse = response as? HTTPURLResponse {
-            if httpResponse.statusCode != 200 {
-                // Non-200 HTTP error (e.g. 401 Unauthorized, 429 Rate Limit, 500 Server Error)
+            let code = httpResponse.statusCode
+            self.responseStatusCode = code
+
+            if let mime = httpResponse.mimeType?.lowercased() {
+                self.isEventStream = mime.contains("text/event-stream")
+            } else if let contentType = httpResponse.allHeaderFields["Content-Type"] as? String {
+                self.isEventStream = contentType.lowercased().contains("text/event-stream")
+            }
+
+            if !(200...299).contains(code) {
+                // Non-2xx HTTP error status
                 self.isLoading = false
-                let code = httpResponse.statusCode
                 switch code {
                 case 401:
                     self.errorMessage = "Groq API error (401): Invalid or unauthorized API key."
@@ -475,6 +492,10 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 default:
                     self.errorMessage = "Groq API error (\(code)): Unable to complete translation."
                 }
+            } else if !self.isEventStream {
+                // 2xx status but not streaming response
+                self.errorMessage = "Groq API error: Unexpected non-streaming response."
+                self.isLoading = false
             }
         }
         completionHandler(.allow)
@@ -482,6 +503,16 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let taskDesc = dataTask.taskDescription, taskDesc == currentRequestId.uuidString else {
+            return
+        }
+
+        // If non-2xx status, parse detailed JSON error message if provided by API
+        if !(200...299).contains(responseStatusCode) {
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let errorObj = json["error"] as? [String: Any],
+               let msg = errorObj["message"] as? String {
+                self.errorMessage = "Groq API error (\(responseStatusCode)): \(msg)"
+            }
             return
         }
 
@@ -507,6 +538,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         if trimmed.isEmpty || trimmed.hasPrefix(":") { return }
 
         if trimmed == "data: [DONE]" {
+            self.receivedDone = true
             self.isLoading = false
             return
         }
@@ -548,6 +580,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         if let error = error as NSError? {
             if error.code == NSURLErrorCancelled { return }
             self.errorMessage = error.localizedDescription
+            return
         }
 
         // Flush any trailing line in buffer
@@ -556,6 +589,15 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 processSSELine(trailingStr)
             }
             streamDataBuffer.removeAll()
+        }
+
+        // Validate stream completeness for successful HTTP responses
+        if (200...299).contains(responseStatusCode) && errorMessage.isEmpty {
+            if outputText.isEmpty {
+                self.errorMessage = "Translation stream completed with empty output."
+            } else if !receivedDone {
+                self.errorMessage = "Translation stream interrupted before completion."
+            }
         }
     }
 }
