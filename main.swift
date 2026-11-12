@@ -167,6 +167,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupHotKeysAndMonitors()
         updateMenuBarMenu()
         observeContentFittingSize()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        handleAppDidBecomeActive()
     }
 
     private func updateMenuBarMenu() {
@@ -201,9 +209,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didBecomeActiveNotification, object: nil)
         GlobalHotKeyManager.shared.teardown()
         teardownMonitors()
         viewModel.cleanup()
+    }
+
+    @objc private func handleAppDidBecomeActive() {
+        let isTrusted = AXIsProcessTrustedWithOptions(nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.viewModel.isAccessibilityTrusted = isTrusted
+        }
     }
 
     @objc func triggerFromMenu() {
@@ -463,27 +479,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var calculatedBounds: NSRect? = nil
 
         if let elem = focusedElement {
-            // Strategy A: Direct kAXSelectedTextAttribute
-            var selectedTextValue: AnyObject?
-            if AXUIElementCopyAttributeValue(elem, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success,
-               let text = selectedTextValue as? String {
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    selectedText = trimmed
+            // Helper to extract text from a single element
+            func extractText(from targetElem: AXUIElement) -> String? {
+                // 1. Direct kAXSelectedTextAttribute
+                var selectedTextValue: AnyObject?
+                if AXUIElementCopyAttributeValue(targetElem, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success,
+                   let text = selectedTextValue as? String {
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        return trimmed
+                    }
                 }
-            }
 
-            // Strategy B: kAXSelectedTextRangeAttribute + kAXStringForRangeParameterizedAttribute / kAXValueAttribute
-            var selectedRangeVal: AnyObject?
-            let rangeResult = AXUIElementCopyAttributeValue(elem, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
-            if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
-                let axRange = rangeAX as! AXValue
+                // 2. Range-based extraction
+                var selectedRangeVal: AnyObject?
+                let rangeResult = AXUIElementCopyAttributeValue(targetElem, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
+                if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
+                    let axRange = rangeAX as! AXValue
 
-                // B1: Parameterized string for range (Safari, WebKit, Pages, TextEdit)
-                if selectedText == nil {
+                    // Parameterized string for range (Safari, WebKit, Pages, TextEdit)
                     var strVal: AnyObject?
                     let strResult = AXUIElementCopyParameterizedAttributeValue(
-                        elem,
+                        targetElem,
                         kAXStringForRangeParameterizedAttribute as CFString,
                         axRange,
                         &strVal
@@ -491,17 +508,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     if strResult == .success, let text = strVal as? String {
                         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmed.isEmpty {
-                            selectedText = trimmed
+                            return trimmed
                         }
                     }
-                }
 
-                // B2: Full string from kAXValueAttribute sliced by CFRange (Chrome, TextFields, Electron)
-                if selectedText == nil {
+                    // Sliced kAXValueAttribute (Chromium, TextFields, Electron)
                     var cfRange = CFRange()
                     if AXValueGetValue(axRange, .cfRange, &cfRange) && cfRange.length > 0 {
                         var valAttr: AnyObject?
-                        if AXUIElementCopyAttributeValue(elem, kAXValueAttribute as CFString, &valAttr) == .success {
+                        if AXUIElementCopyAttributeValue(targetElem, kAXValueAttribute as CFString, &valAttr) == .success {
                             let rawString = (valAttr as? String) ?? ((valAttr as? NSAttributedString)?.string)
                             if let fullText = rawString {
                                 let nsString = fullText as NSString
@@ -509,7 +524,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                     let sub = nsString.substring(with: NSRange(location: cfRange.location, length: cfRange.length))
                                     let trimmed = sub.trimmingCharacters(in: .whitespacesAndNewlines)
                                     if !trimmed.isEmpty {
-                                        selectedText = trimmed
+                                        return trimmed
                                     }
                                 }
                             }
@@ -517,12 +532,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // Extract bounds from AX if available
+                return nil
+            }
+
+            // Attempt extraction on focused element
+            selectedText = extractText(from: elem)
+
+            // Extract bounds from focused element if available
+            var selectedRangeVal: AnyObject?
+            let rangeResult = AXUIElementCopyAttributeValue(elem, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
+            if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
                 var boundsVal: AnyObject?
                 let boundsResult = AXUIElementCopyParameterizedAttributeValue(
                     elem,
                     kAXBoundsForRangeParameterizedAttribute as CFString,
-                    axRange,
+                    rangeAX as! AXValue,
                     &boundsVal
                 )
                 if boundsResult == .success, let bVal = boundsVal, CFGetTypeID(bVal) == AXValueGetTypeID() {
@@ -535,7 +559,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // Strategy C: Check parent hierarchy if text still not found (common in web views / compound controls)
+            // Traverse up to 3 parent levels if text still not found (common in web views / compound controls)
             if selectedText == nil {
                 var currentElem = elem
                 for _ in 0..<3 {
@@ -543,14 +567,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     if AXUIElementCopyAttributeValue(currentElem, kAXParentAttribute as CFString, &parentVal) == .success,
                        let parent = parentVal {
                         let parentElem = parent as! AXUIElement
-                        var parentTextVal: AnyObject?
-                        if AXUIElementCopyAttributeValue(parentElem, kAXSelectedTextAttribute as CFString, &parentTextVal) == .success,
-                           let text = parentTextVal as? String {
-                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !trimmed.isEmpty {
-                                selectedText = trimmed
-                                break
-                            }
+                        if let parentText = extractText(from: parentElem) {
+                            selectedText = parentText
+                            break
                         }
                         currentElem = parentElem
                     } else {
@@ -560,51 +579,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Strategy D: Universal Synthetic Cmd+C Copy Fallback (for Chrome, Slack, Notes, VS Code, Electron)
-        if selectedText == nil || selectedText!.isEmpty {
-            if let copied = copySelectedTextViaSyntheticCommandC() {
-                selectedText = copied
-            }
-        }
-
         return (selectedText, calculatedBounds ?? fallbackRect)
-    }
-
-    /// Universal fallback: simulates Cmd+C to capture highlighted text when Accessibility APIs do not expose selection.
-    private func copySelectedTextViaSyntheticCommandC() -> String? {
-        let pasteboard = NSPasteboard.general
-        let initialChangeCount = pasteboard.changeCount
-
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let cKeyCode: CGKeyCode = 8 // kVK_ANSI_C
-
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: false) else {
-            return nil
-        }
-
-        keyDown.flags = .maskCommand
-        keyUp.flags = []
-
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-
-        // Poll pasteboard for up to 150ms (15 iterations x 10ms)
-        var copiedString: String? = nil
-        for _ in 0..<15 {
-            usleep(10_000)
-            if pasteboard.changeCount != initialChangeCount {
-                if let str = pasteboard.string(forType: .string) {
-                    let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        copiedString = trimmed
-                    }
-                }
-                break
-            }
-        }
-
-        return copiedString
     }
 }
 
