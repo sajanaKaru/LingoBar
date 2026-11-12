@@ -149,7 +149,15 @@ enum AppTab {
 
 class AppViewModel: ObservableObject {
     @Published var selectedTab: AppTab = .translate
-    @Published var inputText: String = ""
+    @Published var inputText: String = "" {
+        didSet {
+            if inputText != oldValue {
+                dismissWorkItem?.cancel()
+                dismissWorkItem = nil
+                copied = false
+            }
+        }
+    }
     @Published var outputText: String = ""
     @Published var warningMessage: String = ""
     @Published var isLoading: Bool = false
@@ -187,6 +195,8 @@ class AppViewModel: ObservableObject {
 
     func runTranslate() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        dismissWorkItem?.cancel()
+        dismissWorkItem = nil
         selectedTab = .translate
         isLoading = true
         errorMessage = ""
@@ -211,6 +221,8 @@ class AppViewModel: ObservableObject {
 
     func runPolish() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        dismissWorkItem?.cancel()
+        dismissWorkItem = nil
         selectedTab = .polish
         isLoading = true
         errorMessage = ""
