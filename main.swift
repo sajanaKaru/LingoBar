@@ -52,17 +52,23 @@ final class GlobalHotKeyManager {
         // 1. Option + Space (kVK_Space = 49, optionKey = 0x0800)
         let spaceID = EventHotKeyID(signature: OSType(0x4C4E4742), id: 1) // 'LNGB', 1
         var spaceRef: EventHotKeyRef?
-        if RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), spaceID, GetApplicationEventTarget(), 0, &spaceRef) == noErr,
-           let r = spaceRef {
+        let spaceStatus = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), spaceID, GetApplicationEventTarget(), 0, &spaceRef)
+        if spaceStatus == noErr, let r = spaceRef {
             hotKeyRefs.append(r)
+            NSLog("[LingoBar] Successfully registered Carbon Global HotKey: Option+Space")
+        } else {
+            NSLog("[LingoBar] Failed to register Carbon Global HotKey Option+Space with status: %d", spaceStatus)
         }
 
         // 2. Option + Shift + L (kVK_ANSI_L = 37, optionKey | shiftKey)
         let lID = EventHotKeyID(signature: OSType(0x4C4E4742), id: 2) // 'LNGB', 2
         var lRef: EventHotKeyRef?
-        if RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(optionKey | shiftKey), lID, GetApplicationEventTarget(), 0, &lRef) == noErr,
-           let r = lRef {
+        let lStatus = RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(optionKey | shiftKey), lID, GetApplicationEventTarget(), 0, &lRef)
+        if lStatus == noErr, let r = lRef {
             hotKeyRefs.append(r)
+            NSLog("[LingoBar] Successfully registered Carbon Global HotKey: Option+Shift+L")
+        } else {
+            NSLog("[LingoBar] Failed to register Carbon Global HotKey Option+Shift+L with status: %d", lStatus)
         }
     }
 
@@ -422,69 +428,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 3. Fallback to synthetic Cmd+C copy if AX selected text returned nil/empty
-        if selectedText == nil {
-            selectedText = captureViaSyntheticCopy()
-        }
-
         return (selectedText, calculatedBounds ?? fallbackRect)
-    }
-
-    /// Captures selected text via synthetic Cmd+C event tap with full pasteboard restoration
-    private func captureViaSyntheticCopy() -> String? {
-        let pasteboard = NSPasteboard.general
-        let initialChangeCount = pasteboard.changeCount
-
-        // Backup current pasteboard items
-        let savedItems: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.compactMap { item in
-            var dict: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    dict[type] = data
-                }
-            }
-            return dict.isEmpty ? nil : dict
-        } ?? []
-
-        // Post synthetic Cmd+C
-        let src = CGEventSource(stateID: .combinedSessionState)
-        guard let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true), // 8 = 'C'
-              let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false) else {
-            return nil
-        }
-        keyDown.flags = .maskCommand
-        keyUp.flags = .maskCommand
-
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-
-        // Wait briefly up to 150ms for pasteboard change
-        var newText: String? = nil
-        let deadline = Date().addingTimeInterval(0.15)
-        while Date() < deadline {
-            usleep(25_000)
-            if pasteboard.changeCount != initialChangeCount {
-                if let copied = pasteboard.string(forType: .string) {
-                    let trimmed = copied.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        newText = trimmed
-                    }
-                }
-                break
-            }
-        }
-
-        // Restore previous pasteboard contents
-        pasteboard.clearContents()
-        for itemDict in savedItems {
-            let pbItem = NSPasteboardItem()
-            for (type, data) in itemDict {
-                pbItem.setData(data, forType: type)
-            }
-            pasteboard.writeObjects([pbItem])
-        }
-
-        return newText
     }
 }
 
