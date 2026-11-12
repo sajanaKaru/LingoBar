@@ -97,7 +97,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func dismissHUD() {
         panel.orderOut(nil)
-        viewModel.copied = false
+        viewModel.resetToEmptyState()
     }
 
     func triggerInstantAction() {
@@ -106,18 +106,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        viewModel.copied = false
-
         // Strictly capture selected text via Accessibility API (no clipboard fallback)
         if let axText = captureSelectedTextViaAccessibility(), !axText.isEmpty {
+            viewModel.resetToEmptyState()
             viewModel.inputText = axText
             viewModel.runTranslate()
         } else {
             // Clean empty state when no text selected or AX is unavailable
-            viewModel.inputText = ""
-            viewModel.outputText = ""
-            viewModel.warningMessage = ""
-            viewModel.errorMessage = ""
+            viewModel.resetToEmptyState()
         }
 
         panel.center()
@@ -172,6 +168,18 @@ class AppViewModel: ObservableObject {
         } else {
             self.apiKey = ""
         }
+    }
+
+    func resetToEmptyState() {
+        currentTask?.cancel()
+        currentTask = nil
+        currentRequestId = UUID()
+        isLoading = false
+        inputText = ""
+        outputText = ""
+        warningMessage = ""
+        errorMessage = ""
+        copied = false
     }
 
     func runTranslate() {
@@ -392,10 +400,7 @@ struct MainContentView: View {
                     Spacer()
                     if !vm.inputText.isEmpty {
                         Button("Clear") {
-                            vm.inputText = ""
-                            vm.outputText = ""
-                            vm.warningMessage = ""
-                            vm.copied = false
+                            vm.resetToEmptyState()
                         }
                         .buttonStyle(.plain)
                         .font(.system(size: 11))
