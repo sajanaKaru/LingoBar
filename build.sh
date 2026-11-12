@@ -18,11 +18,18 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 echo "==> Installing binary, Info.plist, and AppIcon.icns..."
 cp -f "${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
+
+if [ ! -f "Info.plist" ]; then
+    echo "ERROR: Required file 'Info.plist' is missing!" >&2
+    exit 1
+fi
 cp -f Info.plist "${CONTENTS_DIR}/Info.plist"
 
-if [ -f "Resources/AppIcon.icns" ]; then
-    cp -f "Resources/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
+if [ ! -f "Resources/AppIcon.icns" ]; then
+    echo "ERROR: Required icon file 'Resources/AppIcon.icns' is missing!" >&2
+    exit 1
 fi
+cp -f "Resources/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
 
 echo "==> Signing ${APP_BUNDLE} with designated requirement..."
 codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${APP_BUNDLE}"
