@@ -160,6 +160,7 @@ class AppViewModel: ObservableObject {
     private let apiKey: String
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
+    private var dismissWorkItem: DispatchWorkItem?
 
     init() {
         let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
@@ -171,6 +172,8 @@ class AppViewModel: ObservableObject {
     }
 
     func resetToEmptyState() {
+        dismissWorkItem?.cancel()
+        dismissWorkItem = nil
         currentTask?.cancel()
         currentTask = nil
         currentRequestId = UUID()
@@ -314,9 +317,14 @@ class AppViewModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(outputText, forType: .string)
         copied = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+
+        dismissWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.dismissWorkItem = nil
             onDismiss()
         }
+        dismissWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
     }
 }
 
