@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ApplicationServices
 import Carbon
 import Combine
 
@@ -15,168 +16,284 @@ struct LingoBarApp: App {
     }
 }
 
-// MARK: - Floating Panel (Liquid Glass HUD)
-class FloatingPanel: NSPanel {
-    init(contentRect: NSRect, backing: NSWindow.BackingStoreType, defer flag: Bool) {
+// MARK: - Lightweight Non-Activating Inline Popover Panel
+final class InlinePopoverPanel: NSPanel {
+    init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView],
-            backing: backing,
-            defer: flag
-        )
-        self.isFloatingPanel = true
-        self.level = .floating
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        self.titleVisibility = .hidden
-        self.titlebarAppearsTransparent = true
-        self.isMovableByWindowBackground = true
-        self.backgroundColor = .clear
-        self.hasShadow = true
-    }
-
-    override var canBecomeKey: Bool {
-        return true
-    }
-}
-
-// MARK: - App Delegate & Global Hotkey / Event Orchestration
-class AppDelegate: NSObject, NSApplicationDelegate {
-    var panel: FloatingPanel!
-    var statusItem: NSStatusItem?
-    var viewModel = AppViewModel()
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        let contentView = MainContentView(vm: viewModel, onClose: { [weak self] in
-            self?.dismissHUD()
-        })
-
-        panel = FloatingPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 390),
+            styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
-        panel.contentViewController = NSHostingController(rootView: contentView)
-        panel.center()
+        self.isFloatingPanel = true
+        self.level = .popUpMenu
+        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        self.isMovableByWindowBackground = false
+        self.backgroundColor = .clear
+        self.isOpaque = false
+        self.hasShadow = true
+        self.hidesOnDeactivate = false
+    }
+
+    override var canBecomeKey: Bool {
+        return false
+    }
+
+    override var canBecomeMain: Bool {
+        return false
+    }
+}
+
+// MARK: - App Delegate & Coordinate-Anchored Inline Popover Lifecycle
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var panel: InlinePopoverPanel!
+    var statusItem: NSStatusItem?
+    var viewModel = PopoverViewModel()
+    
+    private var globalKeyDownMonitor: Any?
+    private var localKeyDownMonitor: Any?
+    private var globalMouseDownMonitor: Any?
+    private var globalScrollMonitor: Any?
+    private var hostingController: NSHostingController<InlinePopoverView>?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let popoverView = InlinePopoverView(
+            vm: viewModel,
+            onClose: { [weak self] in
+                self?.dismissPopover()
+            }
+        )
+
+        let hc = NSHostingController(rootView: popoverView)
+        self.hostingController = hc
+
+        panel = InlinePopoverPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 180))
+        panel.contentViewController = hc
 
         // Menu Bar Companion
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.title = "🇱🇰 LingoBar"
-            button.action = #selector(toggleHUD)
-            button.target = self
+            let menu = NSMenu()
+            menu.addItem(NSMenuItem(title: "Translate Selection (⌥Space)", action: #selector(triggerFromMenu), keyEquivalent: ""))
+            menu.addItem(NSMenuItem.separator())
+            menu.addItem(NSMenuItem(title: "Quit LingoBar", action: #selector(quitApp), keyEquivalent: "q"))
+            statusItem?.menu = menu
         }
 
+        setupMonitors()
+    }
+
+    @objc func triggerFromMenu() {
+        triggerInstantAction()
+    }
+
+    @objc func quitApp() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func setupMonitors() {
         // Global Hotkey Monitor (Option + Space OR Option + Shift + L)
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+        globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if (flags == [.option, .shift] && event.keyCode == 37) ||
                (flags == [.option] && event.keyCode == 49) {
-                self?.triggerInstantAction()
+                DispatchQueue.main.async {
+                    self?.triggerInstantAction()
+                }
+            } else if event.keyCode == 53 && (self?.panel.isVisible == true) { // Esc key
+                DispatchQueue.main.async {
+                    self?.dismissPopover()
+                }
             }
         }
 
-        // Local Monitor for when the app is active
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            if event.keyCode == 53 { // Escape
-                self?.dismissHUD()
+        // Local Monitor for events when LingoBar is foregrounded
+        localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            if event.keyCode == 53 && (self?.panel.isVisible == true) { // Esc key
+                self?.dismissPopover()
                 return nil
             }
             return event
         }
-    }
 
-    @objc func toggleHUD() {
-        if panel.isVisible {
-            dismissHUD()
-        } else {
-            triggerInstantAction()
+        // Global Mouse Down Monitor to dismiss when clicking outside
+        globalMouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self = self, self.panel.isVisible else { return }
+            let clickLocation = NSEvent.mouseLocation
+            if !self.panel.frame.contains(clickLocation) {
+                DispatchQueue.main.async {
+                    self.dismissPopover()
+                }
+            }
+        }
+
+        // Global Scroll Monitor to dismiss on page / window scroll
+        globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.scrollWheel]) { [weak self] _ in
+            guard let self = self, self.panel.isVisible else { return }
+            DispatchQueue.main.async {
+                self.dismissPopover()
+            }
         }
     }
 
-    func dismissHUD() {
+    func dismissPopover() {
+        guard panel.isVisible else { return }
         panel.orderOut(nil)
         viewModel.resetToEmptyState()
     }
 
     func triggerInstantAction() {
         if panel.isVisible {
-            dismissHUD()
+            dismissPopover()
             return
         }
 
-        // Strictly capture selected text via Accessibility API (no clipboard fallback)
-        if let axText = captureSelectedTextViaAccessibility(), !axText.isEmpty {
-            viewModel.resetToEmptyState()
-            viewModel.inputText = axText
-            viewModel.runTranslate()
-        } else {
-            // Clean empty state when no text selected or AX is unavailable
-            viewModel.resetToEmptyState()
+        // 1. Capture selected text and its bounding box strictly via Accessibility API
+        let captureResult = captureSelectedTextAndBounds()
+        guard let text = captureResult.text, !text.isEmpty else {
+            // If no text is selected, do not present a detached empty box
+            NSSound.beep()
+            return
         }
 
-        panel.center()
-        panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        viewModel.resetToEmptyState()
+        viewModel.inputText = text
+
+        // 2. Compute anchor position
+        let anchorRect = captureResult.bounds
+        positionPanel(anchoredTo: anchorRect)
+
+        // 3. Show non-activating panel (preserves user selection highlight and active app)
+        panel.orderFrontRegardless()
+
+        // 4. Trigger streaming translation
+        viewModel.runTranslate()
     }
 
-    /// Captures selected text strictly via macOS Accessibility API without touching the system clipboard
-    private func captureSelectedTextViaAccessibility() -> String? {
+    /// Positions the popover panel above or below the selection bounds clamped to the current screen
+    private func positionPanel(anchoredTo targetRect: NSRect) {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(targetRect) }) ?? NSScreen.main else {
+            return
+        }
+
+        let visibleFrame = screen.visibleFrame
+        let panelSize = panel.frame.size
+        let margin: CGFloat = 8
+
+        // Try placing below selection first
+        var originX = targetRect.origin.x + (targetRect.width - panelSize.width) / 2.0
+        var originY = targetRect.origin.y - panelSize.height - margin
+
+        // If below screen bottom edge, place above the selection
+        if originY < visibleFrame.minY {
+            originY = targetRect.origin.y + targetRect.height + margin
+        }
+
+        // Horizontal clamping within visible screen bounds
+        if originX < visibleFrame.minX + margin {
+            originX = visibleFrame.minX + margin
+        } else if originX + panelSize.width > visibleFrame.maxX - margin {
+            originX = visibleFrame.maxX - panelSize.width - margin
+        }
+
+        // Vertical clamping
+        if originY + panelSize.height > visibleFrame.maxY - margin {
+            originY = visibleFrame.maxY - panelSize.height - margin
+        }
+        if originY < visibleFrame.minY + margin {
+            originY = visibleFrame.minY + margin
+        }
+
+        panel.setFrameOrigin(NSPoint(x: round(originX), y: round(originY)))
+    }
+
+    /// Captures selected text and converts its AX screen bounds to AppKit desktop coordinates
+    private func captureSelectedTextAndBounds() -> (text: String?, bounds: NSRect) {
+        let mouseLocation = NSEvent.mouseLocation
+        let fallbackRect = NSRect(x: mouseLocation.x - 10, y: mouseLocation.y - 10, width: 20, height: 20)
+
         let systemWide = AXUIElementCreateSystemWide()
         var focusedApp: AnyObject?
         let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
-        guard appResult == .success, let app = focusedApp else { return nil }
+        guard appResult == .success, let app = focusedApp else {
+            return (nil, fallbackRect)
+        }
 
         var focusedUIElement: AnyObject?
         let elemResult = AXUIElementCopyAttributeValue(app as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedUIElement)
-        guard elemResult == .success, let element = focusedUIElement else { return nil }
+        guard elemResult == .success, let element = focusedUIElement else {
+            return (nil, fallbackRect)
+        }
 
         var selectedTextValue: AnyObject?
         let textResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedTextValue)
-        guard textResult == .success, let text = selectedTextValue as? String else { return nil }
+        guard textResult == .success, let text = selectedTextValue as? String else {
+            return (nil, fallbackRect)
+        }
 
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
+        guard !trimmed.isEmpty else {
+            return (nil, fallbackRect)
+        }
 
-// MARK: - View Model & Groq Engine with Request Generation Guards
-enum AppTab {
-    case translate
-    case polish
-}
+        // Attempt to extract exact screen bounds for selected text range
+        var selectedRangeVal: AnyObject?
+        let rangeResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
 
-class AppViewModel: ObservableObject {
-    @Published var selectedTab: AppTab = .translate
-    @Published var inputText: String = "" {
-        didSet {
-            if inputText != oldValue {
-                dismissWorkItem?.cancel()
-                dismissWorkItem = nil
-                copied = false
+        if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
+            var boundsVal: AnyObject?
+            let boundsResult = AXUIElementCopyParameterizedAttributeValue(
+                element as! AXUIElement,
+                kAXBoundsForRangeParameterizedAttribute as CFString,
+                rangeAX as! AXValue,
+                &boundsVal
+            )
+
+            if boundsResult == .success, let bVal = boundsVal, CFGetTypeID(bVal) == AXValueGetTypeID() {
+                var axRect = CGRect.zero
+                if AXValueGetValue(bVal as! AXValue, .cgRect, &axRect) && axRect.width > 0 && axRect.height > 0 {
+                    // Convert AX top-left coordinates to AppKit bottom-left desktop coordinates
+                    let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 0
+                    let appKitY = primaryScreenHeight - axRect.origin.y - axRect.height
+                    let appKitRect = NSRect(x: axRect.origin.x, y: appKitY, width: axRect.width, height: axRect.height)
+                    return (trimmed, appKitRect)
+                }
             }
         }
+
+        // Fallback to mouse location if range bounds are unsupported by the targeted app
+        return (trimmed, fallbackRect)
     }
+}
+
+// MARK: - Popover View Model with Fast Streaming Groq Engine
+class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
+    @Published var inputText: String = ""
     @Published var outputText: String = ""
-    @Published var warningMessage: String = ""
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
     @Published var copied: Bool = false
-    @Published var polishTone: String = "Natural"
 
     private let apiKey: String
+    private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
+    private var streamBuffer: String = ""
     private var dismissWorkItem: DispatchWorkItem?
 
-    init() {
+    override init() {
         let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
         if let key = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
             self.apiKey = key
         } else {
             self.apiKey = ""
         }
+        super.init()
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15.0
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
     func resetToEmptyState() {
@@ -185,10 +302,10 @@ class AppViewModel: ObservableObject {
         currentTask?.cancel()
         currentTask = nil
         currentRequestId = UUID()
+        streamBuffer = ""
         isLoading = false
         inputText = ""
         outputText = ""
-        warningMessage = ""
         errorMessage = ""
         copied = false
     }
@@ -197,12 +314,27 @@ class AppViewModel: ObservableObject {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        selectedTab = .translate
+        currentTask?.cancel()
+
+        let requestId = UUID()
+        currentRequestId = requestId
         isLoading = true
         errorMessage = ""
-        warningMessage = ""
         outputText = ""
         copied = false
+        streamBuffer = ""
+
+        guard !apiKey.isEmpty else {
+            self.isLoading = false
+            self.errorMessage = "Groq API Key not found."
+            return
+        }
+
+        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
+            self.isLoading = false
+            self.errorMessage = "Invalid API URL."
+            return
+        }
 
         let prompt = """
         You are an expert English-to-Sinhala translator focused on zero-friction natural clarity.
@@ -216,48 +348,6 @@ class AppViewModel: ObservableObject {
         \"\"\"\(inputText)\"\"\"
         """
 
-        callGroq(prompt: prompt)
-    }
-
-    func runPolish() {
-        guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        dismissWorkItem?.cancel()
-        dismissWorkItem = nil
-        selectedTab = .polish
-        isLoading = true
-        errorMessage = ""
-        warningMessage = ""
-        outputText = ""
-        copied = false
-
-        let prompt = """
-        You are an elite English writing assistant and copy editor.
-        Rewrite and polish the following English text so that it is grammatically flawless, natural, and matches a \(polishTone.lowercased()) tone.
-        Strict Guidelines:
-        - Output ONLY the polished English text.
-        - Do NOT add explanations, introductory text, quotation marks, or conversational filler.
-        - Retain the exact original intent and key nuances.
-
-        Text to polish:
-        \"\"\"\(inputText)\"\"\"
-        """
-
-        callGroq(prompt: prompt)
-    }
-
-    private func callGroq(prompt: String) {
-        currentTask?.cancel()
-        let requestId = UUID()
-        currentRequestId = requestId
-
-        guard !apiKey.isEmpty else {
-            self.isLoading = false
-            self.errorMessage = "Groq API Key not found in Vault."
-            return
-        }
-
-        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { return }
-
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -269,62 +359,19 @@ class AppViewModel: ObservableObject {
                 ["role": "user", "content": prompt]
             ],
             "temperature": 0.2,
-            "max_tokens": 2048
+            "max_tokens": 1024,
+            "stream": true
         ]
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        currentTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                guard let self = self, self.currentRequestId == requestId else {
-                    return // Ignore responses from cancelled / outdated requests
-                }
-                self.isLoading = false
-
-                if let error = error as NSError?, error.code == NSURLErrorCancelled {
-                    return
-                }
-
-                if let error = error {
-                    self.errorMessage = error.localizedDescription
-                    return
-                }
-
-                guard let data = data else {
-                    self.errorMessage = "No response data received."
-                    return
-                }
-
-                do {
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                            self.errorMessage = msg
-                            return
-                        }
-
-                        if let choices = json["choices"] as? [[String: Any]],
-                           let first = choices.first {
-                            let finishReason = first["finish_reason"] as? String
-                            if let message = first["message"] as? [String: Any],
-                               let content = message["content"] as? String {
-                                self.outputText = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if finishReason == "length" {
-                                    self.warningMessage = "Output truncated due to token limit."
-                                }
-                                return
-                            }
-                        }
-                    }
-                    self.errorMessage = "Invalid response format from Groq."
-                } catch {
-                    self.errorMessage = error.localizedDescription
-                }
-            }
-        }
-        currentTask?.resume()
+        let task = session.dataTask(with: request)
+        task.taskDescription = requestId.uuidString
+        self.currentTask = task
+        task.resume()
     }
 
-    func copyOutputAndDismiss(onDismiss: @escaping () -> Void) {
+    func copyAndDismiss(onDismiss: @escaping () -> Void) {
         guard !outputText.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(outputText, forType: .string)
@@ -336,258 +383,205 @@ class AppViewModel: ObservableObject {
             onDismiss()
         }
         dismissWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    // MARK: - URLSessionDataDelegate (Streaming SSE Chunks)
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let taskDesc = dataTask.taskDescription, taskDesc == currentRequestId.uuidString else {
+            return
+        }
+
+        guard let chunk = String(data: data, encoding: .utf8) else { return }
+        streamBuffer.append(chunk)
+
+        var lines = streamBuffer.components(separatedBy: "\n")
+        streamBuffer = lines.removeLast() // Keep remainder in buffer
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
+            if trimmed == "data: [DONE]" {
+                self.isLoading = false
+                continue
+            }
+            if trimmed.hasPrefix("data: ") {
+                let jsonStr = String(trimmed.dropFirst(6))
+                if let jsonData = jsonStr.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                    if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
+                        self.errorMessage = msg
+                        self.isLoading = false
+                        return
+                    }
+
+                    if let choices = json["choices"] as? [[String: Any]],
+                       let first = choices.first,
+                       let delta = first["delta"] as? [String: Any],
+                       let content = delta["content"] as? String {
+                        self.outputText.append(content)
+                    }
+                }
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let taskDesc = task.taskDescription, taskDesc == currentRequestId.uuidString else {
+            return
+        }
+
+        self.isLoading = false
+
+        if let error = error as NSError? {
+            if error.code == NSURLErrorCancelled { return }
+            self.errorMessage = error.localizedDescription
+        }
+
+        // Flush any remaining content in streamBuffer
+        if !streamBuffer.isEmpty {
+            let trimmed = streamBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("data: ") && trimmed != "data: [DONE]" {
+                let jsonStr = String(trimmed.dropFirst(6))
+                if let jsonData = jsonStr.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let first = choices.first,
+                   let delta = first["delta"] as? [String: Any],
+                   let content = delta["content"] as? String {
+                    self.outputText.append(content)
+                }
+            }
+            streamBuffer = ""
+        }
     }
 }
 
-// MARK: - Liquid Glass UI Views
-struct MainContentView: View {
-    @ObservedObject var vm: AppViewModel
+// MARK: - Native Tooltip / Popover Bubble UI
+struct InlinePopoverView: View {
+    @ObservedObject var vm: PopoverViewModel
     var onClose: () -> Void
-    @FocusState private var isInputFocused: Bool
 
     var body: some View {
-        VStack(spacing: 12) {
-            // Header
-            HStack(alignment: .center) {
-                HStack(spacing: 6) {
-                    Text("🇱🇰")
-                        .font(.system(size: 16))
-                    Text("LingoBar")
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
-                    Text("HUD")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.blue.opacity(0.18))
+        VStack(alignment: .leading, spacing: 8) {
+            // Header Row: Status & Actions
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: "character.book.closed.fill")
                         .foregroundColor(.blue)
-                        .cornerRadius(4)
+                        .font(.system(size: 11))
+                    Text("LingoBar")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.primary.opacity(0.85))
                 }
 
                 Spacer()
 
-                HStack(spacing: 8) {
-                    Text("⌥Space / ⌥⇧L")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(.secondary)
+                if vm.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                }
+
+                if !vm.outputText.isEmpty {
+                    Button(action: {
+                        vm.copyAndDismiss(onDismiss: onClose)
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: vm.copied ? "checkmark.circle.fill" : "doc.on.doc")
+                            Text(vm.copied ? "Copied" : "Copy")
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(vm.copied ? .green : .blue)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.12))
+                        .background(Color.blue.opacity(0.12))
                         .cornerRadius(4)
-
-                    Button(action: onClose) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary.opacity(0.8))
-                            .font(.system(size: 14))
                     }
                     .buttonStyle(.plain)
-                    .help("Close (Esc)")
                 }
-            }
 
-            // Tab Selector
-            Picker("", selection: $vm.selectedTab) {
-                Text("Translate (සිංහල)").tag(AppTab.translate)
-                Text("Polish English").tag(AppTab.polish)
-            }
-            .pickerStyle(.segmented)
-
-            // Tone Selector (Only when polish tab is selected)
-            if vm.selectedTab == .polish {
-                HStack {
-                    Text("Tone:")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.secondary)
-                    Picker("", selection: $vm.polishTone) {
-                        Text("Natural").tag("Natural")
-                        Text("Professional").tag("Professional")
-                        Text("Casual").tag("Casual")
-                        Text("Concise").tag("Concise")
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 140)
-                    Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .padding(3)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Circle())
                 }
-                .transition(.opacity)
+                .buttonStyle(.plain)
+                .help("Close (Esc)")
             }
 
-            // Input Area
+            // Translation Content
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(vm.selectedTab == .translate ? "English Input:" : "Draft Input:")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    if !vm.inputText.isEmpty {
-                        Button("Clear") {
-                            vm.resetToEmptyState()
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 11))
-                        .foregroundColor(.blue)
-                    }
-                }
-
-                TextEditor(text: $vm.inputText)
-                    .font(.system(size: 13))
-                    .frame(height: 72)
-                    .padding(6)
-                    .background(Color(NSColor.textBackgroundColor).opacity(0.85))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                    )
-                    .focused($isInputFocused)
-            }
-
-            // Action / Run Button
-            HStack {
-                Text("⌘ ↵ to run")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
-
-                Spacer()
-
-                Button(action: {
-                    if vm.selectedTab == .translate {
-                        vm.runTranslate()
-                    } else {
-                        vm.runPolish()
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        if vm.isLoading {
-                            ProgressView().controlSize(.small)
-                            Text("Processing...")
-                                .font(.system(size: 12, weight: .medium))
-                        } else {
-                            Image(systemName: vm.selectedTab == .translate ? "character.book.closed" : "wand.and.stars")
-                            Text(vm.selectedTab == .translate ? "Translate" : "Polish")
-                                .font(.system(size: 12, weight: .semibold))
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(vm.isLoading || vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-
-            // Output Card
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(vm.selectedTab == .translate ? "Sinhala (සරල සිංහල):" : "Polished Result:")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary)
-
-                    Spacer()
-
-                    if !vm.outputText.isEmpty {
-                        Button(action: {
-                            vm.copyOutputAndDismiss(onDismiss: onClose)
-                        }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: vm.copied ? "checkmark.circle.fill" : "doc.on.doc")
-                                Text(vm.copied ? "Copied & Closing" : "Copy & Close (↵)")
-                            }
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(vm.copied ? .green : .blue)
-                        }
-                        .buttonStyle(.plain)
-                        .keyboardShortcut(.return, modifiers: [])
-                    }
-                }
-
-                ScrollView {
-                    Text(vm.outputText.isEmpty ? (vm.isLoading ? "Translating with Groq AI..." : "Select text anywhere and hit ⌥Space to translate instantly.") : vm.outputText)
-                        .font(.system(size: 14, weight: .regular))
-                        .lineSpacing(4)
-                        .foregroundColor(vm.outputText.isEmpty ? .secondary.opacity(0.8) : .primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                }
-                .frame(height: 90)
-                .background(Color(NSColor.textBackgroundColor).opacity(0.85))
-                .cornerRadius(8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                )
-
-                if !vm.warningMessage.isEmpty {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        Text(vm.warningMessage)
-                            .foregroundColor(.orange)
-                    }
-                    .font(.system(size: 11))
-                    .padding(.top, 2)
-                }
-
                 if !vm.errorMessage.isEmpty {
-                    Text("Error: \(vm.errorMessage)")
-                        .font(.system(size: 11))
+                    Text(vm.errorMessage)
+                        .font(.system(size: 12))
                         .foregroundColor(.red)
-                        .padding(.top, 2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if vm.outputText.isEmpty && vm.isLoading {
+                    Text("Translating to spoken Sinhala...")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                        .italic()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(vm.outputText)
+                        .font(.system(size: 13.5, weight: .medium))
+                        .lineSpacing(3)
+                        .foregroundColor(.primary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !vm.outputText.isEmpty {
+                    vm.copyAndDismiss(onDismiss: onClose)
                 }
             }
 
-            // Footer
+            // Subdued Hint
             HStack {
-                Button("Esc to close") {
-                    onClose()
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-                .keyboardShortcut(.escape, modifiers: [])
-
+                Text("Click to copy • Esc to dismiss")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary.opacity(0.6))
                 Spacer()
-
-                Button("Quit LingoBar") {
-                    NSApplication.shared.terminate(nil)
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 10))
-                .foregroundColor(.secondary.opacity(0.6))
             }
         }
-        .padding(16)
-        .frame(width: 500, height: 390)
-        .background(VisualEffectView().cornerRadius(14))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+        .padding(12)
+        .frame(width: 340)
+        .background(
+            ZStack {
+                VisualEffectBlur(material: .popover, blendingMode: .behindWindow)
+                Color(NSColor.windowBackgroundColor).opacity(0.65)
+            }
         )
-        .onAppear {
-            if vm.inputText.isEmpty {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    isInputFocused = true
-                }
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            if vm.inputText.isEmpty {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    isInputFocused = true
-                }
-            }
-        }
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.18), radius: 10, x: 0, y: 5)
     }
 }
 
-// MARK: - Blur Visual Effect
-struct VisualEffectView: NSViewRepresentable {
+// MARK: - Native Liquid Glass Blur View
+struct VisualEffectBlur: NSViewRepresentable {
+    var material: NSVisualEffectView.Material = .popover
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
-        view.blendingMode = .behindWindow
+        view.material = material
+        view.blendingMode = blendingMode
         view.state = .active
-        view.material = .hudWindow
         return view
     }
 
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+    }
 }
