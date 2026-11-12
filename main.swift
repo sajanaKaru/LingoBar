@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Carbon
 
 @main
 struct LingoBarApp: App {
@@ -12,44 +13,99 @@ struct LingoBarApp: App {
     }
 }
 
+class FloatingPanel: NSPanel {
+    init(contentRect: NSRect, backing: NSWindow.BackingStoreType, defer flag: Bool) {
+        super.init(contentRect: contentRect,
+                   styleMask: [.nonactivatingPanel, .titled, .closable, .fullSizeContentView],
+                   backing: backing,
+                   defer: flag)
+        self.isFloatingPanel = true
+        self.level = .floating
+        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        self.titleVisibility = .hidden
+        self.titlebarAppearsTransparent = true
+        self.isMovableByWindowBackground = true
+        self.backgroundColor = .clear
+        self.hasShadow = true
+    }
+
+    override var canBecomeKey: Bool {
+        return true
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
+    var panel: FloatingPanel!
     var statusItem: NSStatusItem?
-    var popover = NSPopover()
-    var eventMonitor: Any?
+    var viewModel = AppViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let contentView = MainContentView()
+        // Build floating panel
+        let contentView = MainContentView(vm: viewModel, onClose: { [weak self] in
+            self?.panel.orderOut(nil)
+        })
 
-        popover.contentSize = NSSize(width: 440, height: 420)
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: contentView)
+        panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 380),
+                              backing: .buffered,
+                              defer: false)
+        panel.contentViewController = NSHostingController(rootView: contentView)
+        panel.center()
 
+        // Menu bar indicator
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
             button.title = "🇱🇰 LingoBar"
-            button.action = #selector(togglePopover)
+            button.action = #selector(showApp)
             button.target = self
         }
 
-        NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
-            // Option + Shift + L to toggle
-            if event.modifierFlags.contains([.option, .shift]) && event.keyCode == 37 { // 37 is 'L'
-                self?.togglePopover()
+        // Global hotkey: Option + Space or Option + Shift + L
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            // Option + Shift + L (keyCode 37) or Option + Space (keyCode 49)
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if (flags == [.option, .shift] && event.keyCode == 37) ||
+               (flags == [.option] && event.keyCode == 49) {
+                self?.triggerInstantAction()
             }
         }
     }
 
-    @objc func togglePopover() {
-        if let button = statusItem?.button {
-            if popover.isShown {
-                popover.performClose(nil)
-            } else {
-                // Auto-read clipboard or selected text
-                NotificationCenter.default.post(name: NSNotification.Name("PopoverOpened"), object: nil)
-                popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-                NSApp.activate(ignoringOtherApps: true)
-            }
+    @objc func showApp() {
+        triggerInstantAction()
+    }
+
+    func triggerInstantAction() {
+        if panel.isVisible {
+            panel.orderOut(nil)
+            return
         }
+
+        // 1. Simulate Command + C to copy whatever text is currently selected in any active app
+        simulateCopy()
+
+        // 2. Wait 80ms for clipboard to update, then read and translate
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self = self else { return }
+            let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !clip.isEmpty {
+                self.viewModel.inputText = clip
+                self.viewModel.runTranslate()
+            }
+            self.panel.center()
+            self.panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    private func simulateCopy() {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: true) // 0x08 is 'c'
+        keyDown?.flags = .maskCommand
+        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
+        keyUp?.flags = .maskCommand
+
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
     }
 }
 
@@ -65,8 +121,6 @@ class AppViewModel: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
     @Published var copied: Bool = false
-    
-    // Tone for polishing
     @Published var polishTone: String = "Natural"
 
     private let apiKey: String
@@ -78,22 +132,11 @@ class AppViewModel: ObservableObject {
         } else {
             self.apiKey = ""
         }
-
-        NotificationCenter.default.addObserver(self, selector: #selector(handleOpen), name: NSNotification.Name("PopoverOpened"), object: nil)
-    }
-
-    @objc func handleOpen() {
-        // If clipboard has new text, optionally offer or check
-        if let clip = NSPasteboard.general.string(forType: .string), !clip.isEmpty, inputText.isEmpty {
-            inputText = clip
-            if selectedTab == .translate {
-                runTranslate()
-            }
-        }
     }
 
     func runTranslate() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        selectedTab = .translate
         isLoading = true
         errorMessage = ""
         outputText = ""
@@ -123,6 +166,7 @@ class AppViewModel: ObservableObject {
 
     func runPolish() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        selectedTab = .polish
         isLoading = true
         errorMessage = ""
         outputText = ""
@@ -218,33 +262,38 @@ class AppViewModel: ObservableObject {
 }
 
 struct MainContentView: View {
-    @StateObject var vm = AppViewModel()
+    @ObservedObject var vm: AppViewModel
+    var onClose: () -> Void
 
     var body: some View {
         VStack(spacing: 12) {
-            // Header
+            // Header Bar
             HStack {
-                Text("🇱🇰 LingoBar")
-                    .font(.system(size: 16, weight: .bold))
+                Text("🇱🇰 LingoBar Instant")
+                    .font(.system(size: 15, weight: .bold))
                 Spacer()
-                Text("Shortcut: ⌥⇧L")
+                Text("Shortcut: ⌥Space or ⌥⇧L")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color.secondary.opacity(0.15))
+                    .background(Color.secondary.opacity(0.12))
                     .cornerRadius(4)
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 14))
+                }
+                .buttonStyle(.plain)
             }
-            .padding(.top, 4)
 
-            // Tab Picker
+            // Tab Switcher
             Picker("", selection: $vm.selectedTab) {
-                Text("Translate (සිංහල)").tag(AppTab.translate)
+                Text("Translate (සරල සිංහල)").tag(AppTab.translate)
                 Text("Polish English").tag(AppTab.polish)
             }
             .pickerStyle(.segmented)
 
-            // Polish Tone picker if on polish tab
             if vm.selectedTab == .polish {
                 HStack {
                     Text("Tone:")
@@ -262,10 +311,10 @@ struct MainContentView: View {
                 }
             }
 
-            // Input Area
+            // Input
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(vm.selectedTab == .translate ? "English Text to Translate:" : "Draft English to Polish:")
+                    Text(vm.selectedTab == .translate ? "English Text:" : "Raw English Draft:")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
@@ -282,30 +331,15 @@ struct MainContentView: View {
 
                 TextEditor(text: $vm.inputText)
                     .font(.system(size: 13))
-                    .frame(height: 80)
+                    .frame(height: 75)
                     .padding(4)
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(6)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                    )
             }
 
-            // Action Button
+            // Actions
             HStack {
-                Button(action: {
-                    if let clip = NSPasteboard.general.string(forType: .string) {
-                        vm.inputText = clip
-                    }
-                }) {
-                    Label("Paste", systemImage: "doc.on.clipboard")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
                 Spacer()
-
                 Button(action: {
                     if vm.selectedTab == .translate {
                         vm.runTranslate()
@@ -315,9 +349,9 @@ struct MainContentView: View {
                 }) {
                     if vm.isLoading {
                         ProgressView().controlSize(.small)
-                            .padding(.horizontal, 8)
+                            .padding(.horizontal, 10)
                     } else {
-                        Text(vm.selectedTab == .translate ? "Translate to සිංහල" : "Polish English")
+                        Text(vm.selectedTab == .translate ? "Translate" : "Polish")
                             .fontWeight(.semibold)
                     }
                 }
@@ -326,10 +360,10 @@ struct MainContentView: View {
                 .disabled(vm.isLoading || vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            // Output Area
+            // Output
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(vm.selectedTab == .translate ? "Sinhala Meaning (සරල සිංහල):" : "Polished English:")
+                    Text(vm.selectedTab == .translate ? "Sinhala Meaning:" : "Polished English:")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
@@ -355,13 +389,9 @@ struct MainContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
                 }
-                .frame(height: 90)
+                .frame(height: 85)
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(6)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                )
 
                 if !vm.errorMessage.isEmpty {
                     Text("Error: \(vm.errorMessage)")
@@ -370,22 +400,44 @@ struct MainContentView: View {
                 }
             }
 
-            // Footer
+            // Bottom bar
             HStack {
-                Button("Quit") {
+                Button("Esc to close") {
+                    onClose()
+                }
+                .buttonStyle(.plain)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .keyboardShortcut(.escape, modifiers: [])
+
+                Spacer()
+
+                Button("Quit App") {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundColor(.secondary)
-                Spacer()
-                Text("⌘ + Return to run")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
             }
-            .padding(.bottom, 2)
         }
-        .padding(14)
-        .frame(width: 440, height: 420)
+        .padding(16)
+        .frame(width: 480, height: 380)
+        .background(VisualEffectView().cornerRadius(12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+        )
     }
+}
+
+struct VisualEffectView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.material = .popover
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
