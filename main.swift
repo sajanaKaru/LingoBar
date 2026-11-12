@@ -505,9 +505,11 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                     self.errorMessage = "Groq API error (\(code)): Unable to complete translation."
                 }
             } else if !self.isEventStream {
-                // 2xx status but not streaming response
+                // 2xx status but not streaming response: cancel task immediately to stop data receipt
                 self.errorMessage = "Groq API error: Unexpected non-streaming response."
                 self.isLoading = false
+                completionHandler(.cancel)
+                return
             }
         }
         completionHandler(.allow)
@@ -531,6 +533,15 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         // Multibyte-safe UTF-8 buffering: accumulate bytes and only decode complete lines at '\n'
         streamDataBuffer.append(data)
+
+        let maxStreamBufferSize = 128 * 1024 // 128KB
+        if streamDataBuffer.count > maxStreamBufferSize && !streamDataBuffer.contains(0x0A) {
+            dataTask.cancel()
+            self.errorMessage = "Stream exceeded buffer limit without delimiters."
+            self.isLoading = false
+            self.streamDataBuffer.removeAll()
+            return
+        }
 
         let newlineByte: UInt8 = 0x0A // \n
         while let newlineIndex = streamDataBuffer.firstIndex(of: newlineByte) {
