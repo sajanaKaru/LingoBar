@@ -123,8 +123,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Captures selected text via Accessibility API if available, or simulated Cmd+C with strict clipboard preservation
     private func captureSelectedText(completion: @escaping (String) -> Void) {
-        // 1. Try Accessibility API first (zero clipboard impact)
-        if let axText = getSelectedTextViaAccessibility(), !axText.isEmpty {
+        // 1. Accessibility API First (Zero clipboard impact, 100% provenance)
+        if let axText = getSelectedTextViaAccessibility(), !axText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             completion(axText)
             return
         }
@@ -135,6 +135,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Backup existing pasteboard items
         var savedItems: [[NSPasteboard.PasteboardType: Data]] = []
+        let hadItems = (pasteboard.pasteboardItems?.isEmpty == false)
+
         if let items = pasteboard.pasteboardItems {
             for item in items {
                 var itemDict: [NSPasteboard.PasteboardType: Data] = [:]
@@ -154,13 +156,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Wait 90ms for simulated copy event to register
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
             var capturedText = ""
-            // Ensure changeCount actually incremented, meaning a fresh copy occurred
-            if pasteboard.changeCount != initialChangeCount {
+            // Ensure changeCount strictly incremented by exactly 1, proving our synthetic copy occurred
+            if pasteboard.changeCount == initialChangeCount + 1 {
                 capturedText = pasteboard.string(forType: .string) ?? ""
             }
 
             // Restore previous pasteboard contents faithfully
-            if !savedItems.isEmpty {
+            if hadItems && !savedItems.isEmpty {
                 pasteboard.clearContents()
                 for itemDict in savedItems {
                     let pbItem = NSPasteboardItem()
@@ -169,6 +171,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     pasteboard.writeObjects([pbItem])
                 }
+            } else if !hadItems {
+                // If pasteboard was originally empty, restore it to empty
+                pasteboard.clearContents()
             }
 
             completion(capturedText)
@@ -214,6 +219,7 @@ class AppViewModel: ObservableObject {
     @Published var selectedTab: AppTab = .translate
     @Published var inputText: String = ""
     @Published var outputText: String = ""
+    @Published var warningMessage: String = ""
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
     @Published var copied: Bool = false
@@ -237,6 +243,7 @@ class AppViewModel: ObservableObject {
         selectedTab = .translate
         isLoading = true
         errorMessage = ""
+        warningMessage = ""
         outputText = ""
         copied = false
 
@@ -260,6 +267,7 @@ class AppViewModel: ObservableObject {
         selectedTab = .polish
         isLoading = true
         errorMessage = ""
+        warningMessage = ""
         outputText = ""
         copied = false
 
@@ -340,11 +348,10 @@ class AppViewModel: ObservableObject {
                             let finishReason = first["finish_reason"] as? String
                             if let message = first["message"] as? [String: Any],
                                let content = message["content"] as? String {
-                                var finalOutput = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                                self.outputText = content.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if finishReason == "length" {
-                                    finalOutput += "\n\n⚠️ [Output truncated due to token length limit]"
+                                    self.warningMessage = "Output truncated due to token limit."
                                 }
-                                self.outputText = finalOutput
                                 return
                             }
                         }
@@ -450,6 +457,7 @@ struct MainContentView: View {
                         Button("Clear") {
                             vm.inputText = ""
                             vm.outputText = ""
+                            vm.warningMessage = ""
                             vm.copied = false
                         }
                         .buttonStyle(.plain)
@@ -544,6 +552,17 @@ struct MainContentView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                 )
+
+                if !vm.warningMessage.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(vm.warningMessage)
+                            .foregroundColor(.orange)
+                    }
+                    .font(.system(size: 11))
+                    .padding(.top, 2)
+                }
 
                 if !vm.errorMessage.isEmpty {
                     Text("Error: \(vm.errorMessage)")
