@@ -16,8 +16,72 @@ struct LingoBarApp: App {
     }
 }
 
+// MARK: - Native Carbon Global Hotkey Manager
+final class GlobalHotKeyManager {
+    static let shared = GlobalHotKeyManager()
+    private var hotKeyRefs: [EventHotKeyRef] = []
+    private var eventHandler: EventHandlerRef?
+    var onTrigger: (() -> Void)?
+
+    func setup() {
+        teardown()
+
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let handler: EventHandlerUPP = { _, theEvent, _ -> OSStatus in
+            guard let theEvent = theEvent else { return noErr }
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(
+                theEvent,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+            if status == noErr {
+                DispatchQueue.main.async {
+                    GlobalHotKeyManager.shared.onTrigger?()
+                }
+            }
+            return noErr
+        }
+
+        InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandler)
+
+        // 1. Option + Space (kVK_Space = 49, optionKey = 0x0800)
+        let spaceID = EventHotKeyID(signature: OSType(0x4C4E4742), id: 1) // 'LNGB', 1
+        var spaceRef: EventHotKeyRef?
+        if RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), spaceID, GetApplicationEventTarget(), 0, &spaceRef) == noErr,
+           let r = spaceRef {
+            hotKeyRefs.append(r)
+        }
+
+        // 2. Option + Shift + L (kVK_ANSI_L = 37, optionKey | shiftKey)
+        let lID = EventHotKeyID(signature: OSType(0x4C4E4742), id: 2) // 'LNGB', 2
+        var lRef: EventHotKeyRef?
+        if RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(optionKey | shiftKey), lID, GetApplicationEventTarget(), 0, &lRef) == noErr,
+           let r = lRef {
+            hotKeyRefs.append(r)
+        }
+    }
+
+    func teardown() {
+        for ref in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+        if let handler = eventHandler {
+            RemoveEventHandler(handler)
+            eventHandler = nil
+        }
+    }
+}
+
 // MARK: - Lightweight Non-Activating Inline Popover Panel
 final class InlinePopoverPanel: NSPanel {
+    var allowKeyForInput: Bool = false
+
     init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
@@ -36,7 +100,7 @@ final class InlinePopoverPanel: NSPanel {
     }
 
     override var canBecomeKey: Bool {
-        return false
+        return allowKeyForInput
     }
 
     override var canBecomeMain: Bool {
@@ -83,11 +147,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.menu = menu
         }
 
-        setupMonitors()
+        setupHotKeysAndMonitors()
         observeContentFittingSize()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        GlobalHotKeyManager.shared.teardown()
         teardownMonitors()
         viewModel.cleanup()
     }
@@ -100,8 +165,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    private func setupMonitors() {
-        // Global Hotkey Monitor (Option + Space OR Option + Shift + L)
+    private func setupHotKeysAndMonitors() {
+        // 1. Native Carbon Hotkey Manager (Intercepts Option+Space and Option+Shift+L globally)
+        GlobalHotKeyManager.shared.onTrigger = { [weak self] in
+            self?.triggerInstantAction()
+        }
+        GlobalHotKeyManager.shared.setup()
+
+        // 2. Global Hotkey Monitor as secondary backup
         globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if (flags == [.option, .shift] && event.keyCode == 37) ||
@@ -116,7 +187,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Local Monitor for events when LingoBar is foregrounded
+        // 3. Local Monitor for events when LingoBar is foregrounded
         localKeyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             if event.keyCode == 53 && (self?.panel.isVisible == true) { // Esc key
                 self?.dismissPopover()
@@ -125,7 +196,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         }
 
-        // Global Mouse Down Monitor to dismiss when clicking outside
+        // 4. Global Mouse Down Monitor to dismiss when clicking outside
         globalMouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self = self, self.panel.isVisible else { return }
             let clickLocation = NSEvent.mouseLocation
@@ -136,7 +207,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Global Scroll Monitor to dismiss on page / window scroll
+        // 5. Global Scroll Monitor to dismiss on page / window scroll
         globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.scrollWheel]) { [weak self] _ in
             guard let self = self, self.panel.isVisible else { return }
             DispatchQueue.main.async {
@@ -190,6 +261,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updatePopoverSize()
             }
             .store(in: &cancellables)
+
+        viewModel.$isManualInputMode
+            .sink { [weak self] isManual in
+                self?.panel.allowKeyForInput = isManual
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
     }
 
     private func updatePopoverSize() {
@@ -205,6 +283,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func dismissPopover() {
         guard panel.isVisible else { return }
+        panel.allowKeyForInput = false
         panel.orderOut(nil)
         currentAnchorRect = nil
         viewModel.resetToEmptyState()
@@ -216,25 +295,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 1. Capture selected text and its bounding box strictly via Accessibility API
+        // 1. Capture selected text and its bounding box strictly via Accessibility API + fallback
         let captureResult = captureSelectedTextAndBounds()
-        guard let text = captureResult.text, !text.isEmpty else {
-            NSSound.beep()
-            return
-        }
-
-        viewModel.resetToEmptyState()
-        viewModel.inputText = text
         currentAnchorRect = captureResult.bounds
 
-        // 2. Initial position
-        positionPanel(anchoredTo: captureResult.bounds, desiredHeight: 140)
+        viewModel.resetToEmptyState()
 
-        // 3. Show non-activating panel (preserves user selection highlight and active app)
-        panel.orderFrontRegardless()
+        if let text = captureResult.text, !text.isEmpty {
+            // Selected text found: automatic streaming translation
+            viewModel.isManualInputMode = false
+            panel.allowKeyForInput = false
+            viewModel.inputText = text
 
-        // 4. Trigger streaming translation
-        viewModel.runTranslate()
+            positionPanel(anchoredTo: captureResult.bounds, desiredHeight: 140)
+            panel.orderFrontRegardless()
+            viewModel.runTranslate()
+        } else {
+            // No selection found: open inline pill with manual input field at cursor
+            viewModel.isManualInputMode = true
+            panel.allowKeyForInput = true
+
+            positionPanel(anchoredTo: captureResult.bounds, desiredHeight: 140)
+            panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// Positions the popover panel above or below the selection bounds clamped to the current screen
@@ -281,56 +365,126 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let fallbackRect = NSRect(x: mouseLocation.x - 10, y: mouseLocation.y - 10, width: 20, height: 20)
 
         let systemWide = AXUIElementCreateSystemWide()
+
+        // 1. Try focused application -> focused UI element
+        var focusedElement: AXUIElement?
         var focusedApp: AnyObject?
-        let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
-        guard appResult == .success, let app = focusedApp else {
-            return (nil, fallbackRect)
+        if AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success,
+           let app = focusedApp {
+            var focusedUIElement: AnyObject?
+            if AXUIElementCopyAttributeValue(app as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedUIElement) == .success,
+               let elem = focusedUIElement {
+                focusedElement = (elem as! AXUIElement)
+            }
         }
 
-        var focusedUIElement: AnyObject?
-        let elemResult = AXUIElementCopyAttributeValue(app as! AXUIElement, kAXFocusedUIElementAttribute as CFString, &focusedUIElement)
-        guard elemResult == .success, let element = focusedUIElement else {
-            return (nil, fallbackRect)
+        // 2. Try system-wide focused UI element directly
+        if focusedElement == nil {
+            var directElem: AnyObject?
+            if AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &directElem) == .success,
+               let elem = directElem {
+                focusedElement = (elem as! AXUIElement)
+            }
         }
 
-        var selectedTextValue: AnyObject?
-        let textResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedTextValue)
-        guard textResult == .success, let text = selectedTextValue as? String else {
-            return (nil, fallbackRect)
-        }
+        var selectedText: String? = nil
+        var calculatedBounds: NSRect? = nil
 
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return (nil, fallbackRect)
-        }
+        if let elem = focusedElement {
+            var selectedTextValue: AnyObject?
+            if AXUIElementCopyAttributeValue(elem, kAXSelectedTextAttribute as CFString, &selectedTextValue) == .success,
+               let text = selectedTextValue as? String {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    selectedText = trimmed
+                }
+            }
 
-        // Attempt to extract exact screen bounds for selected text range
-        var selectedRangeVal: AnyObject?
-        let rangeResult = AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
-
-        if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
-            var boundsVal: AnyObject?
-            let boundsResult = AXUIElementCopyParameterizedAttributeValue(
-                element as! AXUIElement,
-                kAXBoundsForRangeParameterizedAttribute as CFString,
-                rangeAX as! AXValue,
-                &boundsVal
-            )
-
-            if boundsResult == .success, let bVal = boundsVal, CFGetTypeID(bVal) == AXValueGetTypeID() {
-                var axRect = CGRect.zero
-                if AXValueGetValue(bVal as! AXValue, .cgRect, &axRect) && axRect.width > 0 && axRect.height > 0 {
-                    // Convert AX top-left coordinates to AppKit bottom-left desktop coordinates
-                    let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 0
-                    let appKitY = primaryScreenHeight - axRect.origin.y - axRect.height
-                    let appKitRect = NSRect(x: axRect.origin.x, y: appKitY, width: axRect.width, height: axRect.height)
-                    return (trimmed, appKitRect)
+            // Extract bounds from AX if available
+            var selectedRangeVal: AnyObject?
+            let rangeResult = AXUIElementCopyAttributeValue(elem, kAXSelectedTextRangeAttribute as CFString, &selectedRangeVal)
+            if rangeResult == .success, let rangeAX = selectedRangeVal, CFGetTypeID(rangeAX) == AXValueGetTypeID() {
+                var boundsVal: AnyObject?
+                let boundsResult = AXUIElementCopyParameterizedAttributeValue(
+                    elem,
+                    kAXBoundsForRangeParameterizedAttribute as CFString,
+                    rangeAX as! AXValue,
+                    &boundsVal
+                )
+                if boundsResult == .success, let bVal = boundsVal, CFGetTypeID(bVal) == AXValueGetTypeID() {
+                    var axRect = CGRect.zero
+                    if AXValueGetValue(bVal as! AXValue, .cgRect, &axRect) && axRect.width > 0 && axRect.height > 0 {
+                        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 0
+                        let appKitY = primaryScreenHeight - axRect.origin.y - axRect.height
+                        calculatedBounds = NSRect(x: axRect.origin.x, y: appKitY, width: axRect.width, height: axRect.height)
+                    }
                 }
             }
         }
 
-        // Fallback to mouse location if range bounds are unsupported by the targeted app
-        return (trimmed, fallbackRect)
+        // 3. Fallback to synthetic Cmd+C copy if AX selected text returned nil/empty
+        if selectedText == nil {
+            selectedText = captureViaSyntheticCopy()
+        }
+
+        return (selectedText, calculatedBounds ?? fallbackRect)
+    }
+
+    /// Captures selected text via synthetic Cmd+C event tap with full pasteboard restoration
+    private func captureViaSyntheticCopy() -> String? {
+        let pasteboard = NSPasteboard.general
+        let initialChangeCount = pasteboard.changeCount
+
+        // Backup current pasteboard items
+        let savedItems: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.compactMap { item in
+            var dict: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    dict[type] = data
+                }
+            }
+            return dict.isEmpty ? nil : dict
+        } ?? []
+
+        // Post synthetic Cmd+C
+        let src = CGEventSource(stateID: .combinedSessionState)
+        guard let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true), // 8 = 'C'
+              let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false) else {
+            return nil
+        }
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+
+        // Wait briefly up to 150ms for pasteboard change
+        var newText: String? = nil
+        let deadline = Date().addingTimeInterval(0.15)
+        while Date() < deadline {
+            usleep(25_000)
+            if pasteboard.changeCount != initialChangeCount {
+                if let copied = pasteboard.string(forType: .string) {
+                    let trimmed = copied.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        newText = trimmed
+                    }
+                }
+                break
+            }
+        }
+
+        // Restore previous pasteboard contents
+        pasteboard.clearContents()
+        for itemDict in savedItems {
+            let pbItem = NSPasteboardItem()
+            for (type, data) in itemDict {
+                pbItem.setData(data, forType: type)
+            }
+            pasteboard.writeObjects([pbItem])
+        }
+
+        return newText
     }
 }
 
@@ -343,6 +497,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var copied: Bool = false
     @Published var isTruncated: Bool = false
     @Published var hadStreamParseError: Bool = false
+    @Published var isManualInputMode: Bool = false
 
     private let apiKey: String
     private var session: URLSession!
@@ -392,6 +547,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         errorMessage = ""
         copied = false
         isTruncated = false
+        isManualInputMode = false
     }
 
     func runTranslate() {
@@ -661,6 +817,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 struct InlinePopoverView: View {
     @ObservedObject var vm: PopoverViewModel
     var onClose: () -> Void
+    @FocusState private var isFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -713,36 +870,69 @@ struct InlinePopoverView: View {
                 .help("Close (Esc)")
             }
 
-            // Translation Content with Smooth ScrollView & Dynamic Clamped Height
-            VStack(alignment: .leading, spacing: 4) {
-                if !vm.errorMessage.isEmpty {
-                    Text(vm.errorMessage)
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else if vm.outputText.isEmpty && vm.isLoading {
-                    Text("Translating to spoken Sinhala...")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                        .italic()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ScrollView(.vertical, showsIndicators: true) {
-                        Text(vm.outputText)
-                            .font(.system(size: 13.5, weight: .medium))
-                            .lineSpacing(3)
-                            .foregroundColor(.primary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 2)
+            // Manual Input Mode (shown when no text was selected)
+            if vm.isManualInputMode && vm.outputText.isEmpty && !vm.isLoading {
+                HStack(spacing: 6) {
+                    TextField("Type English text to translate...", text: $vm.inputText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12.5))
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.12))
+                        .cornerRadius(6)
+                        .focused($isFieldFocused)
+                        .onSubmit {
+                            vm.runTranslate()
+                        }
+
+                    Button(action: {
+                        vm.runTranslate()
+                    }) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.system(size: 16))
+                            .foregroundColor(.blue)
                     }
-                    .frame(maxHeight: 200)
+                    .buttonStyle(.plain)
+                    .disabled(vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .onAppear {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        isFieldFocused = true
+                    }
                 }
             }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if !vm.outputText.isEmpty {
-                    vm.copyAndDismiss(onDismiss: onClose)
+
+            // Translation Content with Smooth ScrollView & Dynamic Clamped Height
+            if !vm.outputText.isEmpty || vm.isLoading || !vm.errorMessage.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    if !vm.errorMessage.isEmpty {
+                        Text(vm.errorMessage)
+                            .font(.system(size: 11.5))
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if vm.outputText.isEmpty && vm.isLoading {
+                        Text("Translating to spoken Sinhala...")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                            .italic()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ScrollView(.vertical, showsIndicators: true) {
+                            Text(vm.outputText)
+                                .font(.system(size: 13.5, weight: .medium))
+                                .lineSpacing(3)
+                                .foregroundColor(.primary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 2)
+                        }
+                        .frame(maxHeight: 200)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if !vm.outputText.isEmpty {
+                        vm.copyAndDismiss(onDismiss: onClose)
+                    }
                 }
             }
 
@@ -772,7 +962,7 @@ struct InlinePopoverView: View {
 
             // Subdued Hint
             HStack {
-                Text("Click to copy • Esc to dismiss")
+                Text(vm.isManualInputMode && vm.outputText.isEmpty ? "Press ↵ to translate • Esc to dismiss" : "Click to copy • Esc to dismiss")
                     .font(.system(size: 9.5))
                     .foregroundColor(.secondary.opacity(0.6))
                 Spacer()
