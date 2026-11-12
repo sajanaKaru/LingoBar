@@ -590,51 +590,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Fallback: Universal Synthetic Cmd+C Copy when AX APIs do not expose selection
-        if selectedText == nil || selectedText!.isEmpty {
-            if let copied = copySelectedTextViaSyntheticCommandC() {
-                selectedText = copied
-            }
-        }
-
         return (selectedText, calculatedBounds ?? fallbackRect)
-    }
-
-    /// Universal fallback: simulates Cmd+C to capture highlighted text when Accessibility APIs do not expose selection.
-    private func copySelectedTextViaSyntheticCommandC() -> String? {
-        let pasteboard = NSPasteboard.general
-        let initialChangeCount = pasteboard.changeCount
-
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let cKeyCode: CGKeyCode = 8 // kVK_ANSI_C
-
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: cKeyCode, keyDown: false) else {
-            return nil
-        }
-
-        keyDown.flags = .maskCommand
-        keyUp.flags = []
-
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
-
-        // Poll pasteboard for up to 150ms (15 iterations x 10ms)
-        var copiedString: String? = nil
-        for _ in 0..<15 {
-            usleep(10_000)
-            if pasteboard.changeCount != initialChangeCount {
-                if let str = pasteboard.string(forType: .string) {
-                    let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        copiedString = trimmed
-                    }
-                }
-                break
-            }
-        }
-
-        return copiedString
     }
 }
 
@@ -1081,24 +1037,25 @@ struct InlinePopoverView: View {
                             vm.runTranslate()
                         }
 
-                    if let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty, vm.inputText.isEmpty {
-                        Button(action: {
+                    Button(action: {
+                        if let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty {
                             vm.inputText = clip
                             vm.runTranslate()
-                        }) {
-                            HStack(spacing: 2) {
-                                Image(systemName: "doc.on.clipboard")
-                                Text("Paste")
-                            }
-                            .font(.system(size: 10, weight: .medium))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                            .background(Color.secondary.opacity(0.12))
-                            .cornerRadius(6)
                         }
-                        .buttonStyle(.plain)
-                        .help("Paste clipboard and translate (⌘V)")
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "doc.on.clipboard")
+                            Text("Paste & Translate")
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background(Color.secondary.opacity(0.12))
+                        .cornerRadius(6)
                     }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut("v", modifiers: .command)
+                    .help("Paste from clipboard and translate (⌘V)")
 
                     Button(action: {
                         vm.runTranslate()
