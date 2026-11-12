@@ -22,9 +22,11 @@ final class GlobalHotKeyManager {
     private var hotKeyRefs: [EventHotKeyRef] = []
     private var eventHandler: EventHandlerRef?
     var onTrigger: (() -> Void)?
+    var hasRegistrationConflict: Bool = false
 
-    func setup() {
+    func setup() -> Bool {
         teardown()
+        hasRegistrationConflict = false
 
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let handler: EventHandlerUPP = { _, theEvent, _ -> OSStatus in
@@ -47,7 +49,11 @@ final class GlobalHotKeyManager {
             return noErr
         }
 
-        InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandler)
+        let installStatus = InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandler)
+        if installStatus != noErr {
+            NSLog("[LingoBar] InstallEventHandler failed with status: %d", installStatus)
+            hasRegistrationConflict = true
+        }
 
         // 1. Option + Space (kVK_Space = 49, optionKey = 0x0800)
         let spaceID = EventHotKeyID(signature: OSType(0x4C4E4742), id: 1) // 'LNGB', 1
@@ -58,6 +64,7 @@ final class GlobalHotKeyManager {
             NSLog("[LingoBar] Successfully registered Carbon Global HotKey: Option+Space")
         } else {
             NSLog("[LingoBar] Failed to register Carbon Global HotKey Option+Space with status: %d", spaceStatus)
+            hasRegistrationConflict = true
         }
 
         // 2. Option + Shift + L (kVK_ANSI_L = 37, optionKey | shiftKey)
@@ -69,7 +76,10 @@ final class GlobalHotKeyManager {
             NSLog("[LingoBar] Successfully registered Carbon Global HotKey: Option+Shift+L")
         } else {
             NSLog("[LingoBar] Failed to register Carbon Global HotKey Option+Shift+L with status: %d", lStatus)
+            hasRegistrationConflict = true
         }
+
+        return !hasRegistrationConflict
     }
 
     func teardown() {
@@ -176,7 +186,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         GlobalHotKeyManager.shared.onTrigger = { [weak self] in
             self?.triggerInstantAction()
         }
-        GlobalHotKeyManager.shared.setup()
+        let hotKeySuccess = GlobalHotKeyManager.shared.setup()
+        if !hotKeySuccess {
+            viewModel.hotKeyConflictMessage = "Global shortcut conflicted with another application. Click menu bar icon or reassign."
+        } else {
+            viewModel.hotKeyConflictMessage = ""
+        }
 
         // 2. Global Hotkey Monitor as secondary backup
         globalKeyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
@@ -274,6 +289,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updatePopoverSize()
             }
             .store(in: &cancellables)
+
+        viewModel.$isAccessibilityTrusted
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
+
+        viewModel.$hotKeyConflictMessage
+            .sink { [weak self] _ in
+                self?.updatePopoverSize()
+            }
+            .store(in: &cancellables)
     }
 
     private func updatePopoverSize() {
@@ -301,11 +328,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 1. Capture selected text and its bounding box strictly via Accessibility API + fallback
+        // 1. Check Accessibility permissions and capture selected text
+        let isTrusted = AXIsProcessTrusted()
+        viewModel.isAccessibilityTrusted = isTrusted
+
         let captureResult = captureSelectedTextAndBounds()
         currentAnchorRect = captureResult.bounds
 
         viewModel.resetToEmptyState()
+        viewModel.isAccessibilityTrusted = isTrusted
 
         if let text = captureResult.text, !text.isEmpty {
             // Selected text found: automatic streaming translation
@@ -442,6 +473,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var isTruncated: Bool = false
     @Published var hadStreamParseError: Bool = false
     @Published var isManualInputMode: Bool = false
+    @Published var isAccessibilityTrusted: Bool = true
+    @Published var hotKeyConflictMessage: String = ""
 
     private let apiKey: String
     private var session: URLSession!
@@ -812,6 +845,46 @@ struct InlinePopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Close (Esc)")
+            }
+
+            // Accessibility Permission Banner (shown when AX permission is missing)
+            if !vm.isAccessibilityTrusted {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "lock.shield.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Accessibility permission needed to auto-read highlighted text.")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(.orange)
+                        Button("Open Privacy & Security > Accessibility") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.blue)
+                    }
+                }
+                .padding(6)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(6)
+            }
+
+            // Global Hotkey Conflict Banner
+            if !vm.hotKeyConflictMessage.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundColor(.yellow)
+                        .font(.system(size: 10))
+                    Text(vm.hotKeyConflictMessage)
+                        .font(.system(size: 10))
+                        .foregroundColor(.primary.opacity(0.8))
+                }
+                .padding(4)
+                .background(Color.yellow.opacity(0.12))
+                .cornerRadius(4)
             }
 
             // Manual Input Mode (shown when no text was selected)
