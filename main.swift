@@ -171,20 +171,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenuBarMenu() {
         guard let button = statusItem?.button else { return }
-        button.title = "🇱🇰 LingoBar"
 
         let menu = NSMenu()
+        let translateItem = NSMenuItem(title: "Translate Selection", action: #selector(triggerFromMenu), keyEquivalent: "")
+
         if !viewModel.hotKeyConflictMessage.isEmpty {
+            button.title = "🇱🇰 LingoBar ⚠️"
+            button.toolTip = "LingoBar: Shortcut conflict detected. Click to translate."
+
             let conflictItem = NSMenuItem(title: "⚠️ Shortcut Conflict: Use Menu to Translate", action: nil, keyEquivalent: "")
             conflictItem.isEnabled = false
             menu.addItem(conflictItem)
             menu.addItem(NSMenuItem.separator())
-            button.toolTip = "LingoBar: Shortcut conflict detected. Click to translate."
+
+            translateItem.keyEquivalent = ""
+            translateItem.keyEquivalentModifierMask = []
         } else {
+            button.title = "🇱🇰 LingoBar"
             button.toolTip = "LingoBar (⌥Space to Translate Selection)"
+
+            translateItem.keyEquivalent = " "
+            translateItem.keyEquivalentModifierMask = [.option]
         }
 
-        menu.addItem(NSMenuItem(title: "Translate Selection (⌥Space)", action: #selector(triggerFromMenu), keyEquivalent: ""))
+        menu.addItem(translateItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit LingoBar", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem?.menu = menu
@@ -320,8 +330,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         viewModel.$hotKeyConflictMessage
+            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updatePopoverSize()
+                self?.updateMenuBarMenu()
             }
             .store(in: &cancellables)
     }
