@@ -45,10 +45,30 @@ fi
 echo "==> Signing staged bundle with designated requirement..."
 codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${STAGING_DIR}"
 
-echo "==> Atomically promoting staged bundle to ${APP_BUNDLE}..."
-rm -rf "${APP_BUNDLE}"
-mv "${STAGING_DIR}" "${APP_BUNDLE}"
-rm -rf ".build_staging"
+echo "==> Verifying signature on staged bundle before promotion..."
+codesign --verify --deep --strict "${STAGING_DIR}"
+
+echo "==> Performing rollback-safe atomic bundle swap..."
+HAS_OLD=0
+if [ -d "${APP_BUNDLE}" ]; then
+    rm -rf "${APP_BUNDLE}.old"
+    mv "${APP_BUNDLE}" "${APP_BUNDLE}.old"
+    HAS_OLD=1
+fi
+
+if mv "${STAGING_DIR}" "${APP_BUNDLE}"; then
+    echo "==> Promotion succeeded. Cleaning up backup and staging..."
+    if [ "${HAS_OLD}" -eq 1 ]; then
+        rm -rf "${APP_BUNDLE}.old"
+    fi
+    rm -rf ".build_staging"
+else
+    echo "ERROR: Bundle promotion failed! Restoring backup..." >&2
+    if [ "${HAS_OLD}" -eq 1 ] && [ -d "${APP_BUNDLE}.old" ]; then
+        mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
+    fi
+    exit 1
+fi
 
 # Final signature check on promoted bundle
 codesign --verify --deep --strict "${APP_BUNDLE}"
