@@ -23,6 +23,8 @@ public struct SettingsView: View {
     @State private var currentTestTask: URLSessionDataTask?
     @State private var currentTestRequestId: UUID?
     @State private var lastTestedKey: String = ""
+    @State private var pendingConflictKey: String? = nil
+    @State private var isLegacyVaultAvailable: Bool = false
 
     public init(isPresented: Binding<Bool>, onKeySaved: (() -> Void)? = nil) {
         self._isPresented = isPresented
@@ -53,6 +55,37 @@ public struct SettingsView: View {
             .padding(.bottom, 2)
 
             Divider()
+
+            // Conflict banner if a different key exists in fallback storage
+            if let conflictKey = pendingConflictKey {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 14))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("A different key was found in local storage.")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        HStack(spacing: 8) {
+                            Button("Use This Key") {
+                                applyConflictKey(conflictKey)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+
+                            Button("Discard") {
+                                discardConflictKey()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(8)
+            }
 
             // AI Provider Picker
             VStack(alignment: .leading, spacing: 6) {
@@ -125,6 +158,19 @@ public struct SettingsView: View {
                     .buttonStyle(.plain)
                     .help("Paste from Clipboard")
                 }
+            }
+
+            // Legacy Vault Import option when Keychain is empty but legacy vault file is available
+            if isLegacyVaultAvailable && (enteredKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || keyStatus == .notConfigured) {
+                Button(action: importFromLegacyVault) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.arrow.down")
+                        Text("Import key from legacy vault")
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
 
             // Status Badge and Test Connection
@@ -283,9 +329,48 @@ public struct SettingsView: View {
             } else {
                 keyStatus = .notConfigured
             }
+            pendingConflictKey = try KeychainHelper.shared.getPendingFallbackConflictKey()
+            isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
         } catch {
             errorMessage = error.localizedDescription
             keyStatus = .notConfigured
+        }
+    }
+
+    private func applyConflictKey(_ key: String) {
+        cancelInFlightTest()
+        errorMessage = ""
+        do {
+            try KeychainHelper.shared.resolveFallbackConflict(useFallbackKey: true)
+            pendingConflictKey = nil
+            enteredKey = key
+            initialKey = key
+            lastTestedKey = ""
+            keyStatus = .unverified
+            onKeySaved?()
+        } catch {
+            errorMessage = "Failed to apply key: \(error.localizedDescription)"
+        }
+    }
+
+    private func discardConflictKey() {
+        KeychainHelper.shared.discardFallbackConflict()
+        pendingConflictKey = nil
+    }
+
+    private func importFromLegacyVault() {
+        cancelInFlightTest()
+        errorMessage = ""
+        do {
+            let imported = try KeychainHelper.shared.importLegacyVaultKey()
+            enteredKey = imported
+            initialKey = imported
+            lastTestedKey = ""
+            keyStatus = .unverified
+            isLegacyVaultAvailable = false
+            onKeySaved?()
+        } catch {
+            errorMessage = "Failed to import legacy key: \(error.localizedDescription)"
         }
     }
 
@@ -307,6 +392,8 @@ public struct SettingsView: View {
             initialKey = ""
             lastTestedKey = ""
             keyStatus = .notConfigured
+            pendingConflictKey = nil
+            isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
             onKeySaved?()
         } catch {
             errorMessage = "Failed to delete key: \(error.localizedDescription)"
@@ -402,6 +489,8 @@ public struct SettingsView: View {
                 try KeychainHelper.shared.saveKey(trimmed)
                 initialKey = trimmed
             }
+            isLegacyVaultAvailable = false
+            pendingConflictKey = nil
             onKeySaved?()
             isPresented = false
         } catch {

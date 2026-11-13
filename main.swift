@@ -71,11 +71,13 @@ class AppViewModel: ObservableObject {
 
     @Published var apiKey: String = ""
     @Published var storageError: String = ""
+    @Published var pendingFallbackConflictKey: String? = nil
 
     init() {
         do {
             try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
             self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+            self.pendingFallbackConflictKey = KeychainHelper.shared.pendingFallbackConflictKey
             self.storageError = ""
         } catch {
             self.storageError = "Keychain error: \(error.localizedDescription)"
@@ -89,6 +91,7 @@ class AppViewModel: ObservableObject {
         DispatchQueue.main.async {
             do {
                 self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+                self.pendingFallbackConflictKey = KeychainHelper.shared.pendingFallbackConflictKey
                 self.storageError = ""
                 if self.errorMessage.contains("API Key") {
                     self.errorMessage = ""

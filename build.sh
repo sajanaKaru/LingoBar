@@ -48,7 +48,7 @@ codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated
 echo "==> Verifying signature on staged bundle before promotion..."
 codesign --verify --deep --strict "${STAGING_DIR}"
 
-echo "==> Performing rollback-safe atomic bundle swap..."
+echo "==> Preparing rollback-safe swap with trap handler..."
 HAS_OLD=0
 if [ -d "${APP_BUNDLE}" ]; then
     rm -rf "${APP_BUNDLE}.old"
@@ -56,21 +56,33 @@ if [ -d "${APP_BUNDLE}" ]; then
     HAS_OLD=1
 fi
 
-if mv "${STAGING_DIR}" "${APP_BUNDLE}"; then
-    echo "==> Promotion succeeded. Cleaning up backup and staging..."
-    if [ "${HAS_OLD}" -eq 1 ]; then
-        rm -rf "${APP_BUNDLE}.old"
+rollback_swap() {
+    echo "ERROR: Bundle swap or verification failed! Rolling back from backup..." >&2
+    if [ "${HAS_OLD}" -eq 1 ] && [ -d "${APP_BUNDLE}.old" ]; then
+        rm -rf "${APP_BUNDLE}"
+        mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
+        echo "==> Rollback complete: Restored previous ${APP_BUNDLE}" >&2
     fi
     rm -rf ".build_staging"
-else
-    echo "ERROR: Bundle promotion failed! Restoring backup..." >&2
-    if [ "${HAS_OLD}" -eq 1 ] && [ -d "${APP_BUNDLE}.old" ]; then
-        mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
-    fi
-    exit 1
-fi
+}
+
+# Arm trap for ERR, INT, TERM
+trap rollback_swap ERR INT TERM
+
+echo "==> Promoting staged bundle to ${APP_BUNDLE}..."
+mv "${STAGING_DIR}" "${APP_BUNDLE}"
 
 # Final signature check on promoted bundle
+echo "==> Verifying promoted bundle signature..."
 codesign --verify --deep --strict "${APP_BUNDLE}"
+
+# Disarm trap only after post-promotion verification successfully passes
+trap - ERR INT TERM
+
+# Cleanup backup only after post-promotion verification passes
+if [ "${HAS_OLD}" -eq 1 ]; then
+    rm -rf "${APP_BUNDLE}.old"
+fi
+rm -rf ".build_staging"
 
 echo "==> Build, packaging, and verification complete: ${APP_BUNDLE}"
