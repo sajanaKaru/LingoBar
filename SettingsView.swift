@@ -160,8 +160,8 @@ public struct SettingsView: View {
                 }
             }
 
-            // Legacy Vault Import option when Keychain is empty but legacy vault file is available
-            if isLegacyVaultAvailable && (enteredKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || keyStatus == .notConfigured) {
+            // Legacy Vault Import option when primary key in Keychain is absent and legacy vault file exists
+            if isLegacyVaultAvailable && initialKey.isEmpty {
                 Button(action: importFromLegacyVault) {
                     HStack(spacing: 5) {
                         Image(systemName: "square.and.arrow.down")
@@ -331,6 +331,9 @@ public struct SettingsView: View {
             }
             pendingConflictKey = try KeychainHelper.shared.getPendingFallbackConflictKey()
             isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
+            if let warning = KeychainHelper.shared.fallbackRecoveryWarning, errorMessage.isEmpty {
+                errorMessage = warning
+            }
         } catch {
             errorMessage = error.localizedDescription
             keyStatus = .notConfigured
@@ -340,37 +343,34 @@ public struct SettingsView: View {
     private func applyConflictKey(_ key: String) {
         cancelInFlightTest()
         errorMessage = ""
-        do {
-            try KeychainHelper.shared.resolveFallbackConflict(useFallbackKey: true)
-            pendingConflictKey = nil
-            enteredKey = key
-            initialKey = key
-            lastTestedKey = ""
-            keyStatus = .unverified
-            onKeySaved?()
-        } catch {
-            errorMessage = "Failed to apply key: \(error.localizedDescription)"
-        }
+        enteredKey = key
+        lastTestedKey = ""
+        keyStatus = .unverified
+        pendingConflictKey = nil
     }
 
     private func discardConflictKey() {
-        KeychainHelper.shared.discardFallbackConflict()
-        pendingConflictKey = nil
+        cancelInFlightTest()
+        errorMessage = ""
+        do {
+            try KeychainHelper.shared.discardFallbackConflict()
+            pendingConflictKey = nil
+        } catch {
+            errorMessage = "Failed to discard fallback key: \(error.localizedDescription)"
+        }
     }
 
     private func importFromLegacyVault() {
         cancelInFlightTest()
         errorMessage = ""
         do {
-            let imported = try KeychainHelper.shared.importLegacyVaultKey()
-            enteredKey = imported
-            initialKey = imported
+            let vaultKey = try KeychainHelper.shared.readLegacyVaultKey()
+            enteredKey = vaultKey
             lastTestedKey = ""
             keyStatus = .unverified
             isLegacyVaultAvailable = false
-            onKeySaved?()
         } catch {
-            errorMessage = "Failed to import legacy key: \(error.localizedDescription)"
+            errorMessage = "Failed to read legacy key: \(error.localizedDescription)"
         }
     }
 
@@ -488,6 +488,8 @@ public struct SettingsView: View {
             } else {
                 try KeychainHelper.shared.saveKey(trimmed)
                 initialKey = trimmed
+                try? KeychainHelper.shared.discardFallbackConflict()
+                UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
             }
             isLegacyVaultAvailable = false
             pendingConflictKey = nil

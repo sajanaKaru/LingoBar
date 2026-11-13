@@ -50,24 +50,27 @@ codesign --verify --deep --strict "${STAGING_DIR}"
 
 echo "==> Preparing rollback-safe swap with trap handler..."
 HAS_OLD=0
-if [ -d "${APP_BUNDLE}" ]; then
-    rm -rf "${APP_BUNDLE}.old"
-    mv "${APP_BUNDLE}" "${APP_BUNDLE}.old"
-    HAS_OLD=1
-fi
 
-rollback_swap() {
-    echo "ERROR: Bundle swap or verification failed! Rolling back from backup..." >&2
+cleanup() {
+    local exit_code=$?
+    echo "ERROR: Bundle swap or verification failed (exit code: ${exit_code})! Rolling back from backup..." >&2
     if [ "${HAS_OLD}" -eq 1 ] && [ -d "${APP_BUNDLE}.old" ]; then
         rm -rf "${APP_BUNDLE}"
         mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
         echo "==> Rollback complete: Restored previous ${APP_BUNDLE}" >&2
     fi
     rm -rf ".build_staging"
+    exit "${exit_code}"
 }
 
-# Arm trap for ERR, INT, TERM
-trap rollback_swap ERR INT TERM
+# Arm trap for EXIT, INT, TERM before moving APP_BUNDLE to APP_BUNDLE.old
+trap cleanup EXIT INT TERM
+
+if [ -d "${APP_BUNDLE}" ]; then
+    rm -rf "${APP_BUNDLE}.old"
+    mv "${APP_BUNDLE}" "${APP_BUNDLE}.old"
+    HAS_OLD=1
+fi
 
 echo "==> Promoting staged bundle to ${APP_BUNDLE}..."
 mv "${STAGING_DIR}" "${APP_BUNDLE}"
@@ -77,7 +80,7 @@ echo "==> Verifying promoted bundle signature..."
 codesign --verify --deep --strict "${APP_BUNDLE}"
 
 # Disarm trap only after post-promotion verification successfully passes
-trap - ERR INT TERM
+trap - EXIT INT TERM
 
 # Cleanup backup only after post-promotion verification passes
 if [ "${HAS_OLD}" -eq 1 ]; then
