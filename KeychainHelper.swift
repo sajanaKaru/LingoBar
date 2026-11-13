@@ -32,9 +32,10 @@ public final class KeychainHelper {
     public static let defaultService = "com.lingobar.macos.apikey"
     public static let defaultAccount = "GROQ_API_KEY"
 
-    // Versioned migration flag (V2 heals premature migration flag from prior build)
-    private static let migrationFlagKey = "com.lingobar.macos.hasMigratedVaultV2"
-    // Separate explicit deletion flag to respect intentional user key removal
+    // Migration flags
+    private static let legacyMigrationFlagKey = "com.lingobar.macos.hasMigratedLegacyKey"
+    private static let migrationV2FlagKey = "com.lingobar.macos.hasMigratedVaultV2"
+    // Explicit deletion flag to respect intentional user key removal
     private static let explicitDeletionFlagKey = "com.lingobar.macos.hasExplicitlyDeletedKey"
 
     private init() {
@@ -42,11 +43,19 @@ public final class KeychainHelper {
     }
 
     /// Safely recovers residual unencrypted UserDefaults keys into Keychain before purging them.
-    /// If save to Keychain fails (e.g. locked Keychain), keys are retained for future recovery.
+    /// Respects intentional user deletions and prevents silent data loss during conflicts.
     private func recoverFallbackKeysAndCleanup() {
         let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
-        var candidateSecret: String?
 
+        // 1. If user explicitly deleted their key, purge residual fallback keys immediately without recovery
+        if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
+            for key in fallbackKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            return
+        }
+
+        var candidateSecret: String?
         for key in fallbackKeys {
             if let val = UserDefaults.standard.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
                 candidateSecret = val
@@ -54,27 +63,34 @@ public final class KeychainHelper {
             }
         }
 
-        if let secret = candidateSecret {
-            if let existing = try? getKey(), !existing.isEmpty {
-                // Keychain already has a valid key; safely purge unencrypted storage
+        guard let secret = candidateSecret else {
+            // No candidate values present; clean up empty string keys
+            for key in fallbackKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            return
+        }
+
+        if let existing = try? getKey(), !existing.isEmpty {
+            if existing == secret {
+                // Key matches Keychain; safely purge redundant unencrypted fallback copy
                 for key in fallbackKeys {
                     UserDefaults.standard.removeObject(forKey: key)
                 }
             } else {
-                // Recover into Keychain first
-                do {
-                    try saveKey(secret)
-                    // Successfully recovered; now purge unencrypted storage
-                    for key in fallbackKeys {
-                        UserDefaults.standard.removeObject(forKey: key)
-                    }
-                } catch {
-                    // Retain fallback keys in UserDefaults if Keychain save failed, enabling future retry
-                }
+                // Conflict detected: Keychain has one key and UserDefaults has a different key.
+                // Retain unencrypted fallback key in UserDefaults to prevent silent data loss.
             }
         } else {
-            for key in fallbackKeys {
-                UserDefaults.standard.removeObject(forKey: key)
+            // Keychain is empty: attempt recovery into Keychain
+            do {
+                try saveKey(secret)
+                // Write succeeded, now safe to purge unencrypted copy
+                for key in fallbackKeys {
+                    UserDefaults.standard.removeObject(forKey: key)
+                }
+            } catch {
+                // Retain fallback keys in UserDefaults if Keychain save failed, enabling future retry
             }
         }
     }
@@ -161,7 +177,7 @@ public final class KeychainHelper {
     }
 
     /// Deletes the stored API key from the macOS Keychain.
-    /// Sets explicit deletion flag to ensure intentional removal is preserved across launches.
+    /// Sets explicit deletion flag and purges any fallback keys from UserDefaults.
     public func deleteKey(account: String = defaultAccount, service: String = defaultService) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -172,26 +188,30 @@ public final class KeychainHelper {
         if status != errSecSuccess && status != errSecItemNotFound {
             throw KeychainError.statusError(status)
         }
-        // Explicit deletion flag preserves intentional deletion so legacy key is not re-imported
+
+        // Explicit deletion marks intentional removal and purges unencrypted fallbacks
         UserDefaults.standard.set(true, forKey: Self.explicitDeletionFlagKey)
+        UserDefaults.standard.removeObject(forKey: "com.lingobar.macos.fallback_api_key")
+        UserDefaults.standard.removeObject(forKey: "GROQ_API_KEY")
     }
 
     /// Performs a one-time migration from the legacy vault file if Keychain has no existing key.
-    /// Uses versioned V2 flag to heal prematurely flagged migrations, while respecting explicit user deletions.
+    /// Respects explicit deletion as well as prior legacy migration flag.
     public func migrateLegacyKeyIfNeeded(account: String = defaultAccount, service: String = defaultService) throws {
-        // 1. If user explicitly deleted their key, do not re-import
-        if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
+        // 1. If user explicitly deleted their key or legacy migration was already completed, do not re-import
+        if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) ||
+           UserDefaults.standard.bool(forKey: Self.legacyMigrationFlagKey) {
             return
         }
 
         // 2. If already migrated with V2 flag, do not re-run
-        if UserDefaults.standard.bool(forKey: Self.migrationFlagKey) {
+        if UserDefaults.standard.bool(forKey: Self.migrationV2FlagKey) {
             return
         }
 
         // 3. If Keychain already contains a valid key, mark flag and return
         if let existing = try getKey(account: account, service: service), !existing.isEmpty {
-            UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
+            UserDefaults.standard.set(true, forKey: Self.migrationV2FlagKey)
             return
         }
 
@@ -205,13 +225,13 @@ public final class KeychainHelper {
             if !trimmed.isEmpty {
                 // Save key to Keychain. Flag is ONLY set after saveKey succeeds!
                 try saveKey(trimmed, account: account, service: service)
-                UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
+                UserDefaults.standard.set(true, forKey: Self.migrationV2FlagKey)
             } else {
-                UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
+                UserDefaults.standard.set(true, forKey: Self.migrationV2FlagKey)
             }
         } else {
             // No legacy file exists
-            UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
+            UserDefaults.standard.set(true, forKey: Self.migrationV2FlagKey)
         }
     }
 }

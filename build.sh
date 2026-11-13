@@ -3,58 +3,54 @@ set -euo pipefail
 
 APP_NAME="LingoBar"
 APP_BUNDLE="${APP_NAME}.app"
-CONTENTS_DIR="${APP_BUNDLE}/Contents"
-MACOS_DIR="${CONTENTS_DIR}/MacOS"
-RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+STAGING_DIR=".build_staging/${APP_BUNDLE}"
+STAGING_CONTENTS="${STAGING_DIR}/Contents"
+STAGING_MACOS="${STAGING_CONTENTS}/MacOS"
+STAGING_RESOURCES="${STAGING_CONTENTS}/Resources"
+
+REQUIRED_SOURCES=(
+    "main.swift"
+    "KeychainHelper.swift"
+    "SettingsView.swift"
+    "Info.plist"
+    "Resources/AppIcon.icns"
+)
+
+echo "==> [Preflight] Verifying all required source files and assets..."
+for src in "${REQUIRED_SOURCES[@]}"; do
+    if [ ! -f "${src}" ]; then
+        echo "ERROR: Preflight check failed: Required source or asset '${src}' is missing!" >&2
+        exit 1
+    fi
+done
+echo "==> [Preflight] All required sources verified."
 
 echo "==> Building ${APP_NAME} binary with swiftc..."
 swiftc -parse-as-library main.swift KeychainHelper.swift SettingsView.swift -o "${APP_NAME}"
 
-echo "==> Preparing bundle directory structure..."
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+echo "==> Assembling bundle in staging directory..."
+rm -rf ".build_staging"
+mkdir -p "${STAGING_MACOS}" "${STAGING_RESOURCES}"
 
-echo "==> Installing binary into app bundle..."
-cp -f "${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
+cp -f "${APP_NAME}" "${STAGING_MACOS}/${APP_NAME}"
+cp -f "Info.plist" "${STAGING_CONTENTS}/Info.plist"
+cp -f "Resources/AppIcon.icns" "${STAGING_RESOURCES}/AppIcon.icns"
 
-# Verify binary installation
-if [ ! -f "${MACOS_DIR}/${APP_NAME}" ]; then
-    echo "ERROR: Target executable '${MACOS_DIR}/${APP_NAME}' is missing!" >&2
+# Verify staging bundle integrity
+if [ ! -f "${STAGING_MACOS}/${APP_NAME}" ] || [ ! -f "${STAGING_CONTENTS}/Info.plist" ] || [ ! -f "${STAGING_RESOURCES}/AppIcon.icns" ]; then
+    echo "ERROR: Staging bundle verification failed!" >&2
     exit 1
 fi
 
-# Ensure Info.plist exists and is installed
-if [ -f "Info.plist" ]; then
-    echo "==> Installing Info.plist..."
-    cp -f Info.plist "${CONTENTS_DIR}/Info.plist"
-elif [ -f "${CONTENTS_DIR}/Info.plist" ]; then
-    echo "==> Retaining existing ${CONTENTS_DIR}/Info.plist"
-else
-    echo "ERROR: Required metadata file 'Info.plist' is missing!" >&2
-    exit 1
-fi
+echo "==> Signing staged bundle with designated requirement..."
+codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${STAGING_DIR}"
 
-if [ ! -f "${CONTENTS_DIR}/Info.plist" ]; then
-    echo "ERROR: Target '${CONTENTS_DIR}/Info.plist' not found in bundle!" >&2
-    exit 1
-fi
+echo "==> Atomically promoting staged bundle to ${APP_BUNDLE}..."
+rm -rf "${APP_BUNDLE}"
+mv "${STAGING_DIR}" "${APP_BUNDLE}"
+rm -rf ".build_staging"
 
-# Ensure AppIcon.icns exists and is installed
-if [ -f "Resources/AppIcon.icns" ]; then
-    echo "==> Installing AppIcon.icns..."
-    cp -f Resources/AppIcon.icns "${RESOURCES_DIR}/AppIcon.icns"
-elif [ -f "${RESOURCES_DIR}/AppIcon.icns" ]; then
-    echo "==> Retaining existing ${RESOURCES_DIR}/AppIcon.icns"
-else
-    echo "ERROR: Required icon file 'Resources/AppIcon.icns' is missing!" >&2
-    exit 1
-fi
+# Final signature check on promoted bundle
+codesign --verify --deep --strict "${APP_BUNDLE}"
 
-if [ ! -f "${RESOURCES_DIR}/AppIcon.icns" ]; then
-    echo "ERROR: Target '${RESOURCES_DIR}/AppIcon.icns' not found in bundle!" >&2
-    exit 1
-fi
-
-echo "==> Signing ${APP_BUNDLE} with designated requirement..."
-codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${APP_BUNDLE}"
-
-echo "==> Build and packaging complete: ${APP_BUNDLE}"
+echo "==> Build, packaging, and verification complete: ${APP_BUNDLE}"
