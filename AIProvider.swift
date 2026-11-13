@@ -61,7 +61,7 @@ public enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI:
             return "gpt-4o-mini"
         case .gemini:
-            return "gemini-2.0-flash"
+            return "gemini-3.8-flash"
         }
     }
 
@@ -72,7 +72,7 @@ public enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI:
             return ["gpt-4o-mini", "gpt-4o"]
         case .gemini:
-            return ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+            return ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-4-argon"]
         }
     }
 
