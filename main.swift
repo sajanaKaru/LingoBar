@@ -139,6 +139,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: InlinePopoverPanel!
     var statusItem: NSStatusItem?
     var viewModel = PopoverViewModel()
+    var settingsWindow: NSWindow?
     
     private var globalKeyDownMonitor: Any?
     private var localKeyDownMonitor: Any?
@@ -181,7 +182,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(openSettings),
+            name: NSNotification.Name("OpenSettings"),
+            object: nil
+        )
         handleAppDidBecomeActive()
+    }
+
+    @objc func openSettings() {
+        if settingsWindow == nil {
+            let settingsView = SettingsView(isPresented: Binding(
+                get: { [weak self] in self?.settingsWindow?.isVisible ?? false },
+                set: { [weak self] isPres in
+                    if !isPres {
+                        self?.settingsWindow?.orderOut(nil)
+                    }
+                }
+            ), onKeySaved: { [weak self] in
+                self?.viewModel.refreshApiKey()
+            })
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 440, height: 480),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "LingoBar Settings"
+            window.center()
+            window.contentView = NSHostingView(rootView: settingsView)
+            window.isReleasedWhenClosed = false
+            self.settingsWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func updateMenuBarMenu() {
@@ -216,6 +251,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(translateItem)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit LingoBar", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem?.menu = menu
@@ -657,7 +694,10 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var isAccessibilityTrusted: Bool = true
     @Published var hotKeyConflictMessage: String = ""
 
-    private let apiKey: String
+    @Published var apiKey: String = ""
+    @Published var storageError: String = ""
+    @Published var fallbackWarning: String = ""
+
     private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
@@ -669,17 +709,35 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     private var receivedDone: Bool = false
 
     override init() {
-        let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
-        if let key = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
-            self.apiKey = key
-        } else {
+        super.init()
+        do {
+            try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
+            self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+            self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+        } catch {
+            self.storageError = "Keychain error: \(error.localizedDescription)"
             self.apiKey = ""
         }
-        super.init()
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20.0
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
+    }
+
+    func refreshApiKey() {
+        DispatchQueue.main.async {
+            do {
+                self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+                self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+                self.storageError = ""
+                if self.errorMessage.contains("API Key") {
+                    self.errorMessage = ""
+                }
+            } catch {
+                self.storageError = "Keychain error: \(error.localizedDescription)"
+                self.apiKey = ""
+            }
+        }
     }
 
     func cleanup() {
@@ -730,7 +788,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         guard !apiKey.isEmpty else {
             self.isLoading = false
-            self.errorMessage = "Groq API Key not found in Vault."
+            self.errorMessage = "Groq API Key not configured. Please open Settings (⌘,) to configure."
             return
         }
 
@@ -1016,6 +1074,19 @@ struct InlinePopoverView: View {
                     .buttonStyle(.plain)
                 }
 
+                Button(action: {
+                    NotificationCenter.default.post(name: NSNotification.Name("OpenSettings"), object: nil)
+                }) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .padding(3)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Settings (⌘,)")
+
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -1026,6 +1097,29 @@ struct InlinePopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Close (Esc)")
+            }
+
+            // API Key Not Configured Banner
+            if vm.apiKey.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "key.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI API Key not configured.")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundColor(.orange)
+                        Button("Configure in Settings (⌘,)") {
+                            NotificationCenter.default.post(name: NSNotification.Name("OpenSettings"), object: nil)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.blue)
+                    }
+                }
+                .padding(6)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(6)
             }
 
             // Accessibility Permission Banner (shown when AX permission is missing)

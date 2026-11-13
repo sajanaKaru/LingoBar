@@ -1,40 +1,97 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 APP_NAME="LingoBar"
 APP_BUNDLE="${APP_NAME}.app"
-CONTENTS_DIR="${APP_BUNDLE}/Contents"
-MACOS_DIR="${CONTENTS_DIR}/MacOS"
-RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+STAGING_DIR=".build_staging/${APP_BUNDLE}"
+STAGING_CONTENTS="${STAGING_DIR}/Contents"
+STAGING_MACOS="${STAGING_CONTENTS}/MacOS"
+STAGING_RESOURCES="${STAGING_CONTENTS}/Resources"
 
-echo "==> Compiling ${APP_NAME} from main.swift..."
-swiftc -parse-as-library main.swift -o "${APP_NAME}"
+REQUIRED_SOURCES=(
+    "main.swift"
+    "KeychainHelper.swift"
+    "SettingsView.swift"
+    "Info.plist"
+    "Resources/AppIcon.icns"
+)
 
-echo "==> Constructing ${APP_BUNDLE} bundle structure..."
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+echo "==> [Preflight] Verifying all required source files and assets..."
+for src in "${REQUIRED_SOURCES[@]}"; do
+    if [ ! -f "${src}" ]; then
+        echo "ERROR: Preflight check failed: Required source or asset '${src}' is missing!" >&2
+        exit 1
+    fi
+done
+echo "==> [Preflight] All required sources verified."
 
-echo "==> Installing binary, Info.plist, and AppIcon.icns..."
-cp -f "${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
+echo "==> Building ${APP_NAME} binary with swiftc..."
+swiftc -parse-as-library main.swift KeychainHelper.swift SettingsView.swift -o "${APP_NAME}"
 
-if [ ! -f "Info.plist" ]; then
-    echo "ERROR: Required file 'Info.plist' is missing!" >&2
+echo "==> Assembling bundle in staging directory..."
+rm -rf ".build_staging"
+mkdir -p "${STAGING_MACOS}" "${STAGING_RESOURCES}"
+
+cp -f "${APP_NAME}" "${STAGING_MACOS}/${APP_NAME}"
+cp -f "Info.plist" "${STAGING_CONTENTS}/Info.plist"
+cp -f "Resources/AppIcon.icns" "${STAGING_RESOURCES}/AppIcon.icns"
+
+# Verify staging bundle integrity
+if [ ! -f "${STAGING_MACOS}/${APP_NAME}" ] || [ ! -f "${STAGING_CONTENTS}/Info.plist" ] || [ ! -f "${STAGING_RESOURCES}/AppIcon.icns" ]; then
+    echo "ERROR: Staging bundle verification failed!" >&2
     exit 1
 fi
-cp -f Info.plist "${CONTENTS_DIR}/Info.plist"
 
-if [ ! -f "Resources/AppIcon.icns" ]; then
-    echo "ERROR: Required icon file 'Resources/AppIcon.icns' is missing!" >&2
-    exit 1
+echo "==> Signing staged bundle with designated requirement..."
+codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${STAGING_DIR}"
+
+echo "==> Verifying signature on staged bundle before promotion..."
+codesign --verify --deep --strict "${STAGING_DIR}"
+
+BACKUP_BUNDLE="${APP_BUNDLE}.backup.$$"
+
+echo "==> Preparing rollback-safe swap with signal-aware trap handlers..."
+
+cleanup() {
+    local sig="${1:-0}"
+    local exit_code=1
+    if [ "${sig}" -eq 2 ]; then
+        exit_code=130
+    elif [ "${sig}" -eq 15 ]; then
+        exit_code=143
+    fi
+
+    if [ -d "${BACKUP_BUNDLE}" ]; then
+        echo "ERROR: Bundle swap or verification failed (signal/status: ${sig}, exit code: ${exit_code})! Rolling back from backup..." >&2
+        rm -rf "${APP_BUNDLE}"
+        mv "${BACKUP_BUNDLE}" "${APP_BUNDLE}"
+        echo "==> Rollback complete: Restored previous ${APP_BUNDLE}" >&2
+    fi
+    rm -rf ".build_staging"
+    exit "${exit_code}"
+}
+
+# Arm traps for ERR, INT, TERM before moving APP_BUNDLE to BACKUP_BUNDLE
+trap 'cleanup 0' ERR
+trap 'cleanup 2' INT
+trap 'cleanup 15' TERM
+
+if [ -d "${APP_BUNDLE}" ]; then
+    rm -rf "${BACKUP_BUNDLE}"
+    mv "${APP_BUNDLE}" "${BACKUP_BUNDLE}"
 fi
-cp -f "Resources/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
 
-echo "==> Signing ${APP_BUNDLE} with designated requirement..."
-codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated => identifier "com.lingobar.macos"' "${APP_BUNDLE}"
+echo "==> Promoting staged bundle to ${APP_BUNDLE}..."
+mv "${STAGING_DIR}" "${APP_BUNDLE}"
 
-echo "==> Verifying code signature..."
-codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
+# Final signature check on promoted bundle
+echo "==> Verifying promoted bundle signature..."
+codesign --verify --deep --strict "${APP_BUNDLE}"
 
-echo "==> Build and packaging completed successfully: ${APP_BUNDLE}"
+# Disarm traps only after post-promotion verification successfully passes
+trap - ERR INT TERM
+
+# Cleanup backup only after post-promotion verification passes
+rm -rf "${BACKUP_BUNDLE}" ".build_staging"
+
+echo "==> Build, packaging, and verification complete: ${APP_BUNDLE}"
