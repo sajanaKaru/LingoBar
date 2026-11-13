@@ -24,6 +24,16 @@ public enum KeychainError: LocalizedError, Equatable {
     }
 }
 
+public struct ConflictCandidate: Identifiable, Equatable {
+    public let id: String
+    public let key: String
+
+    public init(id: String, key: String) {
+        self.id = id
+        self.key = key
+    }
+}
+
 /// KeychainHelper provides secure storage and retrieval of AI API keys
 /// using the macOS Security.framework (kSecClassGenericPassword).
 public final class KeychainHelper {
@@ -32,6 +42,23 @@ public final class KeychainHelper {
     public static let defaultService = "com.lingobar.macos.apikey"
     public static let defaultAccount = "GROQ_API_KEY"
     public static let fallbackAccount = "GROQ_API_KEY_FALLBACK"
+    public static let fallbackAccountPrefix = "com.lingobar.macos.fallback."
+    public static let maxFallbackSlots = 10
+
+    public static func fallbackAccountName(index: Int) -> String {
+        if index == 0 {
+            return fallbackAccount
+        }
+        return "\(fallbackAccountPrefix)\(index)"
+    }
+
+    public static func getAllFallbackAccounts() -> [String] {
+        var accounts = [fallbackAccount]
+        for i in 1..<maxFallbackSlots {
+            accounts.append(fallbackAccountName(index: i))
+        }
+        return accounts
+    }
 
     public static var legacyVaultPath: String {
         return FileManager.default.homeDirectoryForCurrentUser
@@ -52,8 +79,8 @@ public final class KeychainHelper {
     }
 
     /// Safely recovers residual unencrypted UserDefaults keys into Keychain when absence is confirmed.
-    /// If a conflict is detected, retains the fallback key so it can be surfaced in UI via pendingFallbackConflictKey.
-    /// Propagates Keychain errors explicitly rather than misinterpreting errors as key absence.
+    /// If conflicts are detected, stores them in indexed Keychain fallback accounts and purges UserDefaults.
+    /// No secrets remain in plaintext UserDefaults.
     public func recoverFallbackKeys(service: String = defaultService) throws {
         let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
 
@@ -61,6 +88,14 @@ public final class KeychainHelper {
         if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
             for key in fallbackKeys {
                 UserDefaults.standard.removeObject(forKey: key)
+            }
+            for acc in Self.getAllFallbackAccounts() {
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: acc
+                ]
+                SecItemDelete(query as CFDictionary)
             }
             fallbackRecoveryWarning = nil
             return
@@ -72,9 +107,11 @@ public final class KeychainHelper {
             existingPrimary = nil
         }
 
-        var existingSecondary = try getKey(account: Self.fallbackAccount, service: service)
-        if existingSecondary?.isEmpty == true {
-            existingSecondary = nil
+        var securedFallbacks: [(account: String, key: String)] = []
+        for acc in Self.getAllFallbackAccounts() {
+            if let val = try getKey(account: acc, service: service), !val.isEmpty {
+                securedFallbacks.append((account: acc, key: val))
+            }
         }
 
         for key in fallbackKeys {
@@ -99,40 +136,39 @@ public final class KeychainHelper {
                 }
             }
 
-            // Primary key exists. Check candidate against primary and secondary keys:
-            if candidate == existingPrimary {
-                // If it equals the existing primary key, remove it from UserDefaults.
+            // Primary key exists. Check candidate against primary and already-secured fallback accounts:
+            if candidate == existingPrimary || securedFallbacks.contains(where: { $0.key == candidate }) {
                 UserDefaults.standard.removeObject(forKey: key)
-            } else if let secondary = existingSecondary, candidate == secondary {
-                // If it equals an existing secondary key (fallbackAccount), remove it from UserDefaults.
-                UserDefaults.standard.removeObject(forKey: key)
-            } else if let secondary = existingSecondary, secondary != candidate {
-                // If an existing secondary key already exists and differs from this candidate:
-                // DO NOT overwrite the secondary key! Leave this candidate in UserDefaults and surface warning
+                continue
+            }
+
+            // New distinct key: save into next available Keychain fallback account
+            guard let nextAccount = Self.getAllFallbackAccounts().first(where: { acc in
+                !securedFallbacks.contains(where: { $0.account == acc })
+            }) else {
+                // All fallback slots full, leave candidate in UserDefaults and surface warning
                 fallbackRecoveryWarning = "Multiple conflicting keys found in local storage. Review in Settings."
-            } else if existingSecondary == nil {
-                // If no secondary key exists, save this candidate into fallbackAccount and ONLY THEN remove this specific candidate from UserDefaults.
-                do {
-                    try saveKey(candidate, account: Self.fallbackAccount, service: service)
-                    UserDefaults.standard.removeObject(forKey: key)
-                    existingSecondary = candidate
-                    if fallbackRecoveryWarning == nil {
-                        fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
-                    }
-                } catch {
-                    fallbackRecoveryWarning = "Failed to secure conflicting key in Keychain: \(error.localizedDescription)"
-                    throw error
-                }
+                continue
+            }
+
+            do {
+                try saveKey(candidate, account: nextAccount, service: service)
+                UserDefaults.standard.removeObject(forKey: key)
+                securedFallbacks.append((account: nextAccount, key: candidate))
+            } catch {
+                fallbackRecoveryWarning = "Failed to secure conflicting key in Keychain: \(error.localizedDescription)"
+                throw error
             }
         }
 
-        // If no conflicts or warnings were triggered and no secondary key differs from primary:
-        if fallbackRecoveryWarning == nil {
-            if let secondary = existingSecondary, secondary != existingPrimary {
-                fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
-            } else {
-                fallbackRecoveryWarning = nil
-            }
+        // Update warning based on secured fallbacks that differ from primary key
+        let distinctConflicts = securedFallbacks.filter { $0.key != existingPrimary }
+        if distinctConflicts.count > 1 {
+            fallbackRecoveryWarning = "Multiple conflicting keys found in local storage. Review in Settings."
+        } else if distinctConflicts.count == 1 {
+            fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
+        } else {
+            fallbackRecoveryWarning = nil
         }
     }
 
@@ -145,68 +181,121 @@ public final class KeychainHelper {
         }
     }
 
-    /// Returns the conflicting fallback key if one exists in UserDefaults or fallbackAccount that differs from the primary key.
-    public func getPendingFallbackConflictKey(account: String = defaultAccount, service: String = defaultService) throws -> String? {
+    /// Returns all distinct pending conflict candidates stored in Keychain or UserDefaults.
+    public func getPendingConflictCandidates(account: String = defaultAccount, service: String = defaultService) throws -> [ConflictCandidate] {
         if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
-            return nil
+            return []
         }
         let primaryKey = try getKey(account: account, service: service)
         guard let primary = primaryKey, !primary.isEmpty else {
-            return nil // No conflict if primary key does not exist
+            return []
         }
 
-        let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
-        for key in fallbackKeys {
-            if let val = UserDefaults.standard.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
-                if val != primary {
-                    return val
+        var candidates: [ConflictCandidate] = []
+        var seenKeys = Set<String>()
+        seenKeys.insert(primary)
+
+        // 1. Check all Keychain fallback accounts
+        for acc in Self.getAllFallbackAccounts() {
+            if let val = try getKey(account: acc, service: service), !val.isEmpty {
+                if !seenKeys.contains(val) {
+                    seenKeys.insert(val)
+                    candidates.append(ConflictCandidate(id: acc, key: val))
                 }
             }
         }
 
-        // Also check if fallbackAccount has a stored key differing from primary
-        if let fallbackInKeychain = try getKey(account: Self.fallbackAccount, service: service), !fallbackInKeychain.isEmpty {
-            if fallbackInKeychain != primary {
-                return fallbackInKeychain
+        // 2. Also check UserDefaults if any residual unmigrated keys exist
+        let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
+        for key in fallbackKeys {
+            if let val = UserDefaults.standard.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
+                if !seenKeys.contains(val) {
+                    seenKeys.insert(val)
+                    candidates.append(ConflictCandidate(id: key, key: val))
+                }
             }
         }
 
-        return nil
+        return candidates
+    }
+
+    public var pendingConflictCandidates: [ConflictCandidate] {
+        do {
+            return try getPendingConflictCandidates()
+        } catch {
+            return []
+        }
+    }
+
+    /// Returns the first conflicting fallback key if one exists, for backward compatibility.
+    public func getPendingFallbackConflictKey(account: String = defaultAccount, service: String = defaultService) throws -> String? {
+        let candidates = try getPendingConflictCandidates(account: account, service: service)
+        return candidates.first?.key
     }
 
     public var pendingFallbackConflictKey: String? {
-        do {
-            return try getPendingFallbackConflictKey()
-        } catch {
-            return nil
-        }
+        return pendingConflictCandidates.first?.key
     }
 
     /// Resolves the pending fallback conflict by either adopting it as the primary key or discarding it.
     public func resolveFallbackConflict(useFallbackKey: Bool, account: String = defaultAccount, service: String = defaultService) throws {
         if useFallbackKey {
-            if let conflictKey = try getPendingFallbackConflictKey(account: account, service: service) {
-                try saveKey(conflictKey, account: account, service: service)
+            if let candidates = try? getPendingConflictCandidates(account: account, service: service), let first = candidates.first {
+                try saveKey(first.key, account: account, service: service)
+                try discardConflictCandidate(id: first.id, service: service)
+                return
             }
         }
         try discardFallbackConflict(service: service)
     }
 
-    /// Purges all residual fallback storage from UserDefaults and fallback Keychain account.
-    /// Throws KeychainError if secondary Keychain deletion fails.
+    /// Discards a single conflict candidate by ID (Keychain account name or UserDefaults key).
+    public func discardConflictCandidate(id: String, service: String = defaultService) throws {
+        let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
+        if fallbackKeys.contains(id) {
+            UserDefaults.standard.removeObject(forKey: id)
+        } else {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: id
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound {
+                throw KeychainError.statusError(status)
+            }
+        }
+
+        // Recompute warning based on remaining candidates
+        if let remaining = try? getPendingConflictCandidates(service: service) {
+            if remaining.count > 1 {
+                fallbackRecoveryWarning = "Multiple conflicting keys found in local storage. Review in Settings."
+            } else if remaining.count == 1 {
+                fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
+            } else {
+                fallbackRecoveryWarning = nil
+            }
+        } else {
+            fallbackRecoveryWarning = nil
+        }
+    }
+
+    /// Purges all residual fallback storage from UserDefaults and all fallback Keychain accounts.
     public func discardFallbackConflict(service: String = defaultService) throws {
         let fallbackKeys = ["com.lingobar.macos.fallback_api_key", "GROQ_API_KEY"]
         for key in fallbackKeys {
             UserDefaults.standard.removeObject(forKey: key)
         }
-        let fallbackQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.fallbackAccount
-        ]
-        let status = SecItemDelete(fallbackQuery as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
-            throw KeychainError.statusError(status)
+        for acc in Self.getAllFallbackAccounts() {
+            let fallbackQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: acc
+            ]
+            let status = SecItemDelete(fallbackQuery as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound {
+                throw KeychainError.statusError(status)
+            }
         }
         fallbackRecoveryWarning = nil
     }
@@ -298,14 +387,16 @@ public final class KeychainHelper {
         // Only purge secondary/fallback account if explicitDeletionFlagKey is true (i.e. cleanup was pending from a prior user deletion).
         // If explicitDeletionFlagKey is false, leave fallbackAccount intact so an unresolved conflict is not destroyed.
         if account == Self.defaultAccount && UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
-            let fallbackQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecAttrAccount as String: Self.fallbackAccount
-            ]
-            let fallbackStatus = SecItemDelete(fallbackQuery as CFDictionary)
-            if fallbackStatus != errSecSuccess && fallbackStatus != errSecItemNotFound {
-                throw KeychainError.statusError(fallbackStatus)
+            for acc in Self.getAllFallbackAccounts() {
+                let fallbackQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: acc
+                ]
+                let fallbackStatus = SecItemDelete(fallbackQuery as CFDictionary)
+                if fallbackStatus != errSecSuccess && fallbackStatus != errSecItemNotFound {
+                    throw KeychainError.statusError(fallbackStatus)
+                }
             }
             UserDefaults.standard.removeObject(forKey: Self.explicitDeletionFlagKey)
         } else if account == Self.defaultAccount {
@@ -364,16 +455,18 @@ public final class KeychainHelper {
             throw KeychainError.statusError(status)
         }
 
-        // 3. Delete secondary fallback account from Keychain
+        // 3. Delete secondary fallback accounts from Keychain
         if account == Self.defaultAccount {
-            let fallbackQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecAttrAccount as String: Self.fallbackAccount
-            ]
-            let fallbackStatus = SecItemDelete(fallbackQuery as CFDictionary)
-            if fallbackStatus != errSecSuccess && fallbackStatus != errSecItemNotFound {
-                throw KeychainError.statusError(fallbackStatus)
+            for acc in Self.getAllFallbackAccounts() {
+                let fallbackQuery: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: acc
+                ]
+                let fallbackStatus = SecItemDelete(fallbackQuery as CFDictionary)
+                if fallbackStatus != errSecSuccess && fallbackStatus != errSecItemNotFound {
+                    throw KeychainError.statusError(fallbackStatus)
+                }
             }
         }
     }

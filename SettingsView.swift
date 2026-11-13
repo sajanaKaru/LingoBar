@@ -23,8 +23,8 @@ public struct SettingsView: View {
     @State private var currentTestTask: URLSessionDataTask?
     @State private var currentTestRequestId: UUID?
     @State private var lastTestedKey: String = ""
-    @State private var pendingConflictKey: String? = nil
-    @State private var selectedConflictKey: String? = nil
+    @State private var pendingConflictCandidates: [ConflictCandidate] = []
+    @State private var selectedConflictCandidate: ConflictCandidate? = nil
     @State private var isLegacyVaultAvailable: Bool = false
     @State private var isPerformingProgrammaticClear: Bool = false
 
@@ -58,25 +58,31 @@ public struct SettingsView: View {
 
             Divider()
 
-            // Conflict banner if a different key exists in fallback storage
-            if let conflictKey = pendingConflictKey {
+            // Conflict banner if conflicting keys exist in fallback storage
+            if let candidate = pendingConflictCandidates.first {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
                         .font(.system(size: 14))
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("A different key was found in local storage.")
-                            .font(.caption)
-                            .fontWeight(.medium)
+                        if pendingConflictCandidates.count > 1 {
+                            Text("Multiple conflicting keys found in local storage (\(pendingConflictCandidates.count)). Review:")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                        } else {
+                            Text("A different key was found in local storage.")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                        }
                         HStack(spacing: 8) {
                             Button("Use This Key") {
-                                applyConflictKey(conflictKey)
+                                applyConflictCandidate(candidate)
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
 
                             Button("Discard") {
-                                discardConflictKey()
+                                discardConflictCandidate(candidate)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -333,7 +339,7 @@ public struct SettingsView: View {
             } else {
                 keyStatus = .notConfigured
             }
-            pendingConflictKey = try KeychainHelper.shared.getPendingFallbackConflictKey()
+            pendingConflictCandidates = try KeychainHelper.shared.getPendingConflictCandidates()
             isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
             if let warning = KeychainHelper.shared.fallbackRecoveryWarning, errorMessage.isEmpty {
                 errorMessage = warning
@@ -344,22 +350,22 @@ public struct SettingsView: View {
         }
     }
 
-    private func applyConflictKey(_ key: String) {
+    private func applyConflictCandidate(_ candidate: ConflictCandidate) {
         cancelInFlightTest()
         errorMessage = ""
-        enteredKey = key
+        enteredKey = candidate.key
         lastTestedKey = ""
         keyStatus = .unverified
-        selectedConflictKey = key
-        pendingConflictKey = nil
+        selectedConflictCandidate = candidate
+        pendingConflictCandidates.removeAll(where: { $0.id == candidate.id })
     }
 
-    private func discardConflictKey() {
+    private func discardConflictCandidate(_ candidate: ConflictCandidate) {
         cancelInFlightTest()
         errorMessage = ""
         do {
-            try KeychainHelper.shared.discardFallbackConflict()
-            pendingConflictKey = nil
+            try KeychainHelper.shared.discardConflictCandidate(id: candidate.id)
+            pendingConflictCandidates.removeAll(where: { $0.id == candidate.id })
             onKeySaved?()
         } catch {
             errorMessage = "Failed to discard fallback key: \(error.localizedDescription)"
@@ -402,8 +408,8 @@ public struct SettingsView: View {
             initialKey = ""
             lastTestedKey = ""
             keyStatus = .notConfigured
-            pendingConflictKey = nil
-            selectedConflictKey = nil
+            pendingConflictCandidates = []
+            selectedConflictCandidate = nil
             isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
             onKeySaved?()
         }
@@ -514,11 +520,14 @@ public struct SettingsView: View {
             return
         }
 
-        if let selected = selectedConflictKey, trimmed == selected {
+        if let selected = selectedConflictCandidate, trimmed == selected.key {
             do {
-                try KeychainHelper.shared.discardFallbackConflict()
-                selectedConflictKey = nil
+                try KeychainHelper.shared.discardConflictCandidate(id: selected.id)
+                selectedConflictCandidate = nil
             } catch {
+                if !pendingConflictCandidates.contains(where: { $0.id == selected.id }) {
+                    pendingConflictCandidates.insert(selected, at: 0)
+                }
                 errorMessage = "Key saved, but failed to clean up secondary storage: \(error.localizedDescription)"
                 return
             }
