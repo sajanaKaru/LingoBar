@@ -3,6 +3,7 @@ import AppKit
 
 public enum KeyConnectionStatus: Equatable {
     case notConfigured
+    case unverified
     case testing
     case connected
     case invalid(String)
@@ -18,6 +19,9 @@ public struct SettingsView: View {
     @State private var keyStatus: KeyConnectionStatus = .notConfigured
     @State private var isTesting: Bool = false
     @State private var initialKey: String = ""
+    @State private var errorMessage: String = ""
+    @State private var currentTestTask: URLSessionDataTask?
+    @State private var lastTestedKey: String = ""
 
     public init(isPresented: Binding<Bool>, onKeySaved: (() -> Void)? = nil) {
         self._isPresented = isPresented
@@ -34,7 +38,10 @@ public struct SettingsView: View {
                 Text("Settings")
                     .font(.system(size: 16, weight: .bold))
                 Spacer()
-                Button(action: { isPresented = false }) {
+                Button(action: {
+                    cancelInFlightTest()
+                    isPresented = false
+                }) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 16))
                         .foregroundColor(.secondary)
@@ -131,6 +138,13 @@ public struct SettingsView: View {
                             .font(.caption)
                             .fontWeight(.medium)
                             .foregroundColor(.orange)
+                    case .unverified:
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundColor(.yellow)
+                        Text("Saved (Unverified)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.yellow)
                     case .testing:
                         ProgressView()
                             .controlSize(.small)
@@ -175,6 +189,18 @@ public struct SettingsView: View {
                 .disabled(isTesting || enteredKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
+            // Error display if Keychain operation failed
+            if !errorMessage.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "xmark.octagon.fill")
+                        .foregroundColor(.red)
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .lineLimit(2)
+                }
+            }
+
             Divider()
 
             // Footer Actions
@@ -191,6 +217,7 @@ public struct SettingsView: View {
                 Spacer()
 
                 Button("Cancel") {
+                    cancelInFlightTest()
                     isPresented = false
                 }
                 .buttonStyle(.bordered)
@@ -208,22 +235,47 @@ public struct SettingsView: View {
         .frame(width: 420)
         .onAppear(perform: loadCurrentKey)
         .onChange(of: enteredKey) { _, newKey in
-            if newKey != initialKey {
-                if newKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    keyStatus = .notConfigured
-                } else if keyStatus == .connected {
-                    keyStatus = .notConfigured
-                }
-            }
+            handleInputChanged(newKey: newKey)
         }
     }
 
-    private func loadCurrentKey() {
-        if let key = KeychainHelper.shared.getKey(), !key.isEmpty {
-            enteredKey = key
-            initialKey = key
-            keyStatus = .connected
+    private func cancelInFlightTest() {
+        currentTestTask?.cancel()
+        currentTestTask = nil
+        isTesting = false
+    }
+
+    private func handleInputChanged(newKey: String) {
+        // Cancel in-flight test when user changes input to prevent race conditions
+        if isTesting {
+            cancelInFlightTest()
+        }
+
+        let trimmed = newKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            keyStatus = .notConfigured
+        } else if trimmed == lastTestedKey && keyStatus == .connected {
+            // Key matches the one that was tested and connected
+        } else if trimmed == initialKey {
+            keyStatus = .unverified
         } else {
+            keyStatus = .notConfigured
+        }
+        errorMessage = ""
+    }
+
+    private func loadCurrentKey() {
+        errorMessage = ""
+        do {
+            if let key = try KeychainHelper.shared.getKey(), !key.isEmpty {
+                enteredKey = key
+                initialKey = key
+                keyStatus = .unverified
+            } else {
+                keyStatus = .notConfigured
+            }
+        } catch {
+            errorMessage = error.localizedDescription
             keyStatus = .notConfigured
         }
     }
@@ -238,10 +290,18 @@ public struct SettingsView: View {
     }
 
     private func clearKey() {
-        enteredKey = ""
-        keyStatus = .notConfigured
-        KeychainHelper.shared.deleteKey()
-        onKeySaved?()
+        cancelInFlightTest()
+        errorMessage = ""
+        do {
+            try KeychainHelper.shared.deleteKey()
+            enteredKey = ""
+            initialKey = ""
+            lastTestedKey = ""
+            keyStatus = .notConfigured
+            onKeySaved?()
+        } catch {
+            errorMessage = "Failed to delete key: \(error.localizedDescription)"
+        }
     }
 
     private func testConnection() {
@@ -251,8 +311,11 @@ public struct SettingsView: View {
             return
         }
 
+        cancelInFlightTest()
         isTesting = true
         keyStatus = .testing
+        errorMessage = ""
+        let targetKey = trimmed
 
         guard let url = URL(string: "https://api.groq.com/openai/v1/models") else {
             isTesting = false
@@ -262,16 +325,26 @@ public struct SettingsView: View {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("Bearer \(trimmed)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(targetKey)", forHTTPHeaderField: "Authorization")
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 5.0
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
             DispatchQueue.main.async {
                 self.isTesting = false
+                self.currentTestTask = nil
+
+                // Race condition check: Verify current text still matches the tested key
+                let currentTrimmed = self.enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard currentTrimmed == targetKey else {
+                    return
+                }
+
                 if let error = error {
                     let nsErr = error as NSError
-                    if nsErr.code == NSURLErrorTimedOut {
+                    if nsErr.code == NSURLErrorCancelled {
+                        return
+                    } else if nsErr.code == NSURLErrorTimedOut {
                         self.keyStatus = .invalid("Connection timed out (5s)")
                     } else {
                         self.keyStatus = .invalid("Network error")
@@ -286,23 +359,40 @@ public struct SettingsView: View {
 
                 if httpResponse.statusCode == 200 {
                     self.keyStatus = .connected
+                    self.lastTestedKey = targetKey
                 } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
                     self.keyStatus = .invalid("Invalid Key (401)")
                 } else {
                     self.keyStatus = .invalid("Error (\(httpResponse.statusCode))")
                 }
             }
-        }.resume()
+        }
+        currentTestTask = task
+        task.resume()
     }
 
     private func saveKey() {
+        cancelInFlightTest()
         let trimmed = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            KeychainHelper.shared.deleteKey()
-        } else {
-            KeychainHelper.shared.saveKey(trimmed)
+        errorMessage = ""
+
+        do {
+            if trimmed.isEmpty {
+                try KeychainHelper.shared.deleteKey()
+                initialKey = ""
+                keyStatus = .notConfigured
+            } else {
+                try KeychainHelper.shared.saveKey(trimmed)
+                initialKey = trimmed
+                if trimmed != lastTestedKey || keyStatus != .connected {
+                    keyStatus = .unverified
+                }
+            }
+            onKeySaved?()
+            isPresented = false
+        } catch {
+            errorMessage = "Failed to save key: \(error.localizedDescription)"
+            // Do NOT dismiss settings on error
         }
-        onKeySaved?()
-        isPresented = false
     }
 }

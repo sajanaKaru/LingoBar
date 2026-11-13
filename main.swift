@@ -73,14 +73,14 @@ class AppViewModel: ObservableObject {
 
     init() {
         KeychainHelper.shared.migrateLegacyKeyIfNeeded()
-        self.apiKey = KeychainHelper.shared.getKey() ?? ""
+        self.apiKey = (try? KeychainHelper.shared.getKey()) ?? ""
 
         NotificationCenter.default.addObserver(self, selector: #selector(handleOpen), name: NSNotification.Name("PopoverOpened"), object: nil)
     }
 
     func refreshApiKey() {
         DispatchQueue.main.async {
-            self.apiKey = KeychainHelper.shared.getKey() ?? ""
+            self.apiKey = (try? KeychainHelper.shared.getKey()) ?? ""
             if !self.apiKey.isEmpty && self.errorMessage.contains("API Key") {
                 self.errorMessage = ""
             }

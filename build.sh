@@ -16,13 +16,30 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 echo "==> Installing binary into app bundle..."
 cp -f "${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
 
+# Verify binary installation
+if [ ! -f "${MACOS_DIR}/${APP_NAME}" ]; then
+    echo "ERROR: Target executable '${MACOS_DIR}/${APP_NAME}' is missing!" >&2
+    exit 1
+fi
+
+# Ensure Info.plist exists and is installed
 if [ -f "Info.plist" ]; then
+    echo "==> Installing Info.plist..."
     cp -f Info.plist "${CONTENTS_DIR}/Info.plist"
 elif [ -f "${CONTENTS_DIR}/Info.plist" ]; then
     echo "==> Retaining existing ${CONTENTS_DIR}/Info.plist"
+else
+    echo "ERROR: Required metadata file 'Info.plist' is missing!" >&2
+    exit 1
+fi
+
+if [ ! -f "${CONTENTS_DIR}/Info.plist" ]; then
+    echo "ERROR: Target '${CONTENTS_DIR}/Info.plist' not found in bundle!" >&2
+    exit 1
 fi
 
 if [ -f "Resources/AppIcon.icns" ]; then
+    echo "==> Installing AppIcon.icns..."
     cp -f Resources/AppIcon.icns "${RESOURCES_DIR}/AppIcon.icns"
 fi
 
