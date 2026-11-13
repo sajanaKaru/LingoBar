@@ -66,58 +66,72 @@ public final class KeychainHelper {
             return
         }
 
-        var candidateSecret: String?
-        for key in fallbackKeys {
-            if let val = UserDefaults.standard.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
-                candidateSecret = val
-                break
-            }
-        }
-
-        guard let secret = candidateSecret else {
-            // No candidate values present; clean up empty string keys
-            for key in fallbackKeys {
-                UserDefaults.standard.removeObject(forKey: key)
-            }
-            fallbackRecoveryWarning = nil
-            return
-        }
-
         // Explicit Keychain read: do not mistake transient/locked Keychain errors for absence!
-        let existingKey = try getKey(account: Self.defaultAccount, service: service)
+        var existingPrimary = try getKey(account: Self.defaultAccount, service: service)
+        if existingPrimary?.isEmpty == true {
+            existingPrimary = nil
+        }
 
-        if let existing = existingKey, !existing.isEmpty {
-            if existing == secret {
-                // Key matches Keychain; safely purge redundant unencrypted fallback copy
-                for key in fallbackKeys {
-                    UserDefaults.standard.removeObject(forKey: key)
-                }
-                fallbackRecoveryWarning = nil
-            } else {
-                // Conflict detected: primary key differs from candidate key.
-                // Store the secret securely in Keychain under fallbackAccount and remove from plaintext UserDefaults!
+        var existingSecondary = try getKey(account: Self.fallbackAccount, service: service)
+        if existingSecondary?.isEmpty == true {
+            existingSecondary = nil
+        }
+
+        for key in fallbackKeys {
+            guard let raw = UserDefaults.standard.string(forKey: key),
+                  let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines) as String?,
+                  !candidate.isEmpty else {
+                // Absent or empty value; cleanly purge key
+                UserDefaults.standard.removeObject(forKey: key)
+                continue
+            }
+
+            // If no primary key exists in Keychain, recover candidate into defaultAccount
+            if existingPrimary == nil {
                 do {
-                    try saveKey(secret, account: Self.fallbackAccount, service: service)
-                    for key in fallbackKeys {
-                        UserDefaults.standard.removeObject(forKey: key)
+                    try saveKey(candidate, account: Self.defaultAccount, service: service)
+                    UserDefaults.standard.removeObject(forKey: key)
+                    existingPrimary = candidate
+                    continue
+                } catch {
+                    fallbackRecoveryWarning = "Failed to store recovered key in Keychain: \(error.localizedDescription)"
+                    throw error
+                }
+            }
+
+            // Primary key exists. Check candidate against primary and secondary keys:
+            if candidate == existingPrimary {
+                // If it equals the existing primary key, remove it from UserDefaults.
+                UserDefaults.standard.removeObject(forKey: key)
+            } else if let secondary = existingSecondary, candidate == secondary {
+                // If it equals an existing secondary key (fallbackAccount), remove it from UserDefaults.
+                UserDefaults.standard.removeObject(forKey: key)
+            } else if let secondary = existingSecondary, secondary != candidate {
+                // If an existing secondary key already exists and differs from this candidate:
+                // DO NOT overwrite the secondary key! Leave this candidate in UserDefaults and surface warning
+                fallbackRecoveryWarning = "Multiple conflicting keys found in local storage. Review in Settings."
+            } else if existingSecondary == nil {
+                // If no secondary key exists, save this candidate into fallbackAccount and ONLY THEN remove this specific candidate from UserDefaults.
+                do {
+                    try saveKey(candidate, account: Self.fallbackAccount, service: service)
+                    UserDefaults.standard.removeObject(forKey: key)
+                    existingSecondary = candidate
+                    if fallbackRecoveryWarning == nil {
+                        fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
                     }
-                    fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
                 } catch {
                     fallbackRecoveryWarning = "Failed to secure conflicting key in Keychain: \(error.localizedDescription)"
                     throw error
                 }
             }
-        } else {
-            // Keychain absence is confirmed: recover into default account
-            do {
-                try saveKey(secret, account: Self.defaultAccount, service: service)
-                for key in fallbackKeys {
-                    UserDefaults.standard.removeObject(forKey: key)
-                }
+        }
+
+        // If no conflicts or warnings were triggered and no secondary key differs from primary:
+        if fallbackRecoveryWarning == nil {
+            if let secondary = existingSecondary, secondary != existingPrimary {
+                fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
+            } else {
                 fallbackRecoveryWarning = nil
-            } catch {
-                fallbackRecoveryWarning = "Failed to store recovered key in Keychain: \(error.localizedDescription)"
-                throw error
             }
         }
     }
@@ -194,6 +208,7 @@ public final class KeychainHelper {
         if status != errSecSuccess && status != errSecItemNotFound {
             throw KeychainError.statusError(status)
         }
+        fallbackRecoveryWarning = nil
     }
 
     /// Indicates whether a valid non-empty key exists in the legacy vault file.

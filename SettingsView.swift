@@ -26,6 +26,7 @@ public struct SettingsView: View {
     @State private var pendingConflictKey: String? = nil
     @State private var selectedConflictKey: String? = nil
     @State private var isLegacyVaultAvailable: Bool = false
+    @State private var isPerformingProgrammaticClear: Bool = false
 
     public init(isPresented: Binding<Bool>, onKeySaved: (() -> Void)? = nil) {
         self._isPresented = isPresented
@@ -317,7 +318,9 @@ public struct SettingsView: View {
         } else {
             keyStatus = .notConfigured
         }
-        errorMessage = ""
+        if !isPerformingProgrammaticClear {
+            errorMessage = ""
+        }
     }
 
     private func loadCurrentKey() {
@@ -357,6 +360,7 @@ public struct SettingsView: View {
         do {
             try KeychainHelper.shared.discardFallbackConflict()
             pendingConflictKey = nil
+            onKeySaved?()
         } catch {
             errorMessage = "Failed to discard fallback key: \(error.localizedDescription)"
         }
@@ -387,6 +391,10 @@ public struct SettingsView: View {
 
     @discardableResult
     private func deleteStoredKey() -> Bool {
+        isPerformingProgrammaticClear = true
+        defer {
+            isPerformingProgrammaticClear = false
+        }
         cancelInFlightTest()
         errorMessage = ""
         defer {
@@ -498,17 +506,24 @@ public struct SettingsView: View {
         do {
             try KeychainHelper.shared.saveKey(trimmed)
             initialKey = trimmed
-            if let selected = selectedConflictKey, trimmed == selected {
-                try KeychainHelper.shared.discardFallbackConflict()
-                selectedConflictKey = nil
-            }
             UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
             isLegacyVaultAvailable = false
             onKeySaved?()
-            isPresented = false
         } catch {
             errorMessage = "Failed to save key: \(error.localizedDescription)"
-            // Do NOT dismiss settings on error
+            return
         }
+
+        if let selected = selectedConflictKey, trimmed == selected {
+            do {
+                try KeychainHelper.shared.discardFallbackConflict()
+                selectedConflictKey = nil
+            } catch {
+                errorMessage = "Key saved, but failed to clean up secondary storage: \(error.localizedDescription)"
+                return
+            }
+        }
+
+        isPresented = false
     }
 }
