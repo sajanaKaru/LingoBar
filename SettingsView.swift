@@ -59,22 +59,22 @@ public struct SettingsView: View {
             Divider()
 
             // Conflict banner if conflicting keys exist in fallback storage
-            if let candidate = pendingConflictCandidates.first {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                        .font(.system(size: 14))
-                    VStack(alignment: .leading, spacing: 6) {
-                        if pendingConflictCandidates.count > 1 {
-                            Text("Multiple conflicting keys found in local storage (\(pendingConflictCandidates.count)). Review:")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                        } else {
-                            Text("A different key was found in local storage.")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                        }
+            if !pendingConflictCandidates.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(pendingConflictCandidates.count > 1 ? "Multiple conflicting keys found in storage (\(pendingConflictCandidates.count)):" : "Conflicting key found in storage:")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+
+                    ForEach(pendingConflictCandidates) { candidate in
                         HStack(spacing: 8) {
+                            Text(candidate.maskedKey)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            Spacer()
                             Button("Use This Key") {
                                 applyConflictCandidate(candidate)
                             }
@@ -87,6 +87,7 @@ public struct SettingsView: View {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                         }
+                        .padding(.vertical, 2)
                     }
                 }
                 .padding(10)
@@ -524,7 +525,9 @@ public struct SettingsView: View {
             do {
                 try KeychainHelper.shared.discardConflictCandidate(id: selected.id)
                 selectedConflictCandidate = nil
+                UserDefaults.standard.removeObject(forKey: KeychainHelper.pendingRedundantCleanupKey)
             } catch {
+                UserDefaults.standard.set(true, forKey: KeychainHelper.pendingRedundantCleanupKey)
                 if !pendingConflictCandidates.contains(where: { $0.id == selected.id }) {
                     pendingConflictCandidates.insert(selected, at: 0)
                 }

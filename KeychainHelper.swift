@@ -32,6 +32,14 @@ public struct ConflictCandidate: Identifiable, Equatable {
         self.id = id
         self.key = key
     }
+
+    public var maskedKey: String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 8 else {
+            return "••••••••"
+        }
+        return "\(trimmed.prefix(4))...\(trimmed.suffix(4))"
+    }
 }
 
 /// KeychainHelper provides secure storage and retrieval of AI API keys
@@ -44,6 +52,7 @@ public final class KeychainHelper {
     public static let fallbackAccount = "GROQ_API_KEY_FALLBACK"
     public static let fallbackAccountPrefix = "com.lingobar.macos.fallback."
     public static let maxFallbackSlots = 10
+    public static let pendingRedundantCleanupKey = "com.lingobar.macos.hasPendingRedundantCleanup"
 
     public static func fallbackAccountName(index: Int) -> String {
         if index == 0 {
@@ -89,13 +98,21 @@ public final class KeychainHelper {
             for key in fallbackKeys {
                 UserDefaults.standard.removeObject(forKey: key)
             }
+            var deletionFailedStatus: OSStatus? = nil
             for acc in Self.getAllFallbackAccounts() {
                 let query: [String: Any] = [
                     kSecClass as String: kSecClassGenericPassword,
                     kSecAttrService as String: service,
                     kSecAttrAccount as String: acc
                 ]
-                SecItemDelete(query as CFDictionary)
+                let status = SecItemDelete(query as CFDictionary)
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    deletionFailedStatus = status
+                }
+            }
+            if let status = deletionFailedStatus {
+                fallbackRecoveryWarning = "Keychain deletion error (\(status)). Cleanup will retry."
+                return
             }
             fallbackRecoveryWarning = nil
             return
@@ -173,6 +190,7 @@ public final class KeychainHelper {
     }
 
     func recoverFallbackKeysAndCleanup(service: String = defaultService) {
+        cleanupRedundantFallbacksIfNeeded(service: service)
         do {
             try recoverFallbackKeys(service: service)
         } catch {
@@ -181,8 +199,38 @@ public final class KeychainHelper {
         }
     }
 
+    /// Cleans up any redundant fallback Keychain items whose keys match the primary key.
+    /// Retries if hasPendingRedundantCleanup was previously recorded.
+    public func cleanupRedundantFallbacksIfNeeded(service: String = defaultService) {
+        guard UserDefaults.standard.bool(forKey: Self.pendingRedundantCleanupKey) else {
+            return
+        }
+        guard let primary = try? getKey(account: Self.defaultAccount, service: service), !primary.isEmpty else {
+            return
+        }
+
+        var allCleaned = true
+        for acc in Self.getAllFallbackAccounts() {
+            if let val = try? getKey(account: acc, service: service), val == primary {
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: service,
+                    kSecAttrAccount as String: acc
+                ]
+                let status = SecItemDelete(query as CFDictionary)
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    allCleaned = false
+                }
+            }
+        }
+        if allCleaned {
+            UserDefaults.standard.removeObject(forKey: Self.pendingRedundantCleanupKey)
+        }
+    }
+
     /// Returns all distinct pending conflict candidates stored in Keychain or UserDefaults.
     public func getPendingConflictCandidates(account: String = defaultAccount, service: String = defaultService) throws -> [ConflictCandidate] {
+        cleanupRedundantFallbacksIfNeeded(service: service)
         if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
             return []
         }
@@ -242,7 +290,13 @@ public final class KeychainHelper {
         if useFallbackKey {
             if let candidates = try? getPendingConflictCandidates(account: account, service: service), let first = candidates.first {
                 try saveKey(first.key, account: account, service: service)
-                try discardConflictCandidate(id: first.id, service: service)
+                do {
+                    try discardConflictCandidate(id: first.id, service: service)
+                    UserDefaults.standard.removeObject(forKey: Self.pendingRedundantCleanupKey)
+                } catch {
+                    UserDefaults.standard.set(true, forKey: Self.pendingRedundantCleanupKey)
+                    throw error
+                }
                 return
             }
         }
@@ -265,6 +319,9 @@ public final class KeychainHelper {
                 throw KeychainError.statusError(status)
             }
         }
+
+        // Immediate in-session migration retry: freeing a slot allows pending UserDefaults candidates to be secured
+        try? recoverFallbackKeys(service: service)
 
         // Recompute warning based on remaining candidates
         if let remaining = try? getPendingConflictCandidates(service: service) {
