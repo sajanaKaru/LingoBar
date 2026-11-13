@@ -695,6 +695,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var hotKeyConflictMessage: String = ""
 
     @Published var apiKey: String = ""
+    @Published var activeProvider: AIProvider = AIProvider.current
     @Published var storageError: String = ""
     @Published var fallbackWarning: String = ""
 
@@ -712,8 +713,10 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         super.init()
         do {
             try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
-            self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
-            self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+            let provider = AIProvider.current
+            self.activeProvider = provider
+            self.apiKey = (try KeychainHelper.shared.getKey(account: provider.keychainAccount)) ?? ""
+            self.fallbackWarning = (provider == .groq) ? (KeychainHelper.shared.fallbackRecoveryWarning ?? "") : ""
         } catch {
             self.storageError = "Keychain error: \(error.localizedDescription)"
             self.apiKey = ""
@@ -727,8 +730,10 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     func refreshApiKey() {
         DispatchQueue.main.async {
             do {
-                self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
-                self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+                let provider = AIProvider.current
+                self.activeProvider = provider
+                self.apiKey = (try KeychainHelper.shared.getKey(account: provider.keychainAccount)) ?? ""
+                self.fallbackWarning = (provider == .groq) ? (KeychainHelper.shared.fallbackRecoveryWarning ?? "") : ""
                 self.storageError = ""
                 if self.errorMessage.contains("API Key") {
                     self.errorMessage = ""
@@ -786,15 +791,19 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         streamDataBuffer.removeAll()
         errorDataBuffer.removeAll()
 
+        let provider = AIProvider.current
+        self.activeProvider = provider
+        do {
+            self.apiKey = (try KeychainHelper.shared.getKey(account: provider.keychainAccount)) ?? ""
+        } catch {
+            self.apiKey = ""
+        }
+        let model = provider.selectedModel
+        let url = provider.chatEndpoint
+
         guard !apiKey.isEmpty else {
             self.isLoading = false
-            self.errorMessage = "Groq API Key not configured. Please open Settings (⌘,) to configure."
-            return
-        }
-
-        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
-            self.isLoading = false
-            self.errorMessage = "Invalid API endpoint URL."
+            self.errorMessage = "\(provider.displayName) API Key not configured. Please open Settings (⌘,) to configure."
             return
         }
 
@@ -816,7 +825,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body: [String: Any] = [
-            "model": "openai/gpt-oss-120b",
+            "model": model,
             "messages": [
                 ["role": "user", "content": prompt]
             ],
@@ -868,17 +877,19 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             if !(200...299).contains(code) {
                 // Non-2xx HTTP error status
                 self.isLoading = false
+                let name = self.activeProvider.displayName
                 switch code {
                 case 401:
-                    self.errorMessage = "Groq API error (401): Invalid or unauthorized API key."
+                    self.errorMessage = "\(name) API error (401): Invalid or unauthorized API key."
                 case 429:
-                    self.errorMessage = "Groq API error (429): Rate limit exceeded. Try again shortly."
+                    self.errorMessage = "\(name) API error (429): Rate limit or quota exceeded. Try again shortly."
                 default:
-                    self.errorMessage = "Groq API error (\(code)): Unable to complete translation."
+                    self.errorMessage = "\(name) API error (\(code)): Unable to complete translation."
                 }
             } else if !self.isEventStream {
                 // 2xx status but not streaming response: cancel task immediately to stop data receipt
-                self.errorMessage = "Groq API error: Unexpected non-streaming response."
+                let name = self.activeProvider.displayName
+                self.errorMessage = "\(name) API error: Unexpected non-streaming response."
                 self.isLoading = false
                 self.currentRequestId = UUID()
                 self.streamDataBuffer.removeAll()
@@ -965,7 +976,14 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
             // Check for API-level error returned within stream
             if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                self.errorMessage = msg
+                let code = errorObj["code"] as? String
+                let name = self.activeProvider.displayName
+                if code == "insufficient_quota" || msg.lowercased().contains("quota") {
+                    let billingUrl = (self.activeProvider == .openAI) ? "platform.openai.com/account/billing" : "console.groq.com"
+                    self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
+                } else {
+                    self.errorMessage = "\(name) API error: \(msg)"
+                }
                 self.isLoading = false
                 return
             }
@@ -998,11 +1016,18 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         // If non-2xx status, parse the accumulated complete JSON error body
         if !(200...299).contains(responseStatusCode) {
+            let name = self.activeProvider.displayName
             if !errorDataBuffer.isEmpty,
                let json = try? JSONSerialization.jsonObject(with: errorDataBuffer) as? [String: Any],
-               let errorObj = json["error"] as? [String: Any],
-               let msg = errorObj["message"] as? String {
-                self.errorMessage = "Groq API error (\(responseStatusCode)): \(msg)"
+               let errorObj = json["error"] as? [String: Any] {
+                let code = errorObj["code"] as? String
+                let msg = errorObj["message"] as? String ?? "Unable to complete request."
+                if code == "insufficient_quota" || msg.lowercased().contains("quota") {
+                    let billingUrl = (self.activeProvider == .openAI) ? "platform.openai.com/account/billing" : "console.groq.com"
+                    self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
+                } else {
+                    self.errorMessage = "\(name) API error (\(responseStatusCode)): \(msg)"
+                }
             }
             errorDataBuffer.removeAll()
             return
@@ -1106,7 +1131,7 @@ struct InlinePopoverView: View {
                         .foregroundColor(.orange)
                         .font(.system(size: 11))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("AI API Key not configured.")
+                        Text("\(vm.activeProvider.displayName) API Key not configured.")
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundColor(.orange)
                         Button("Configure in Settings (⌘,)") {
