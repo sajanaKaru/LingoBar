@@ -72,17 +72,27 @@ class AppViewModel: ObservableObject {
     @Published var apiKey: String = ""
 
     init() {
-        KeychainHelper.shared.migrateLegacyKeyIfNeeded()
-        self.apiKey = (try? KeychainHelper.shared.getKey()) ?? ""
+        do {
+            try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
+            self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+        } catch {
+            self.errorMessage = "Keychain error: \(error.localizedDescription)"
+            self.apiKey = ""
+        }
 
         NotificationCenter.default.addObserver(self, selector: #selector(handleOpen), name: NSNotification.Name("PopoverOpened"), object: nil)
     }
 
     func refreshApiKey() {
         DispatchQueue.main.async {
-            self.apiKey = (try? KeychainHelper.shared.getKey()) ?? ""
-            if !self.apiKey.isEmpty && self.errorMessage.contains("API Key") {
-                self.errorMessage = ""
+            do {
+                self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+                if !self.apiKey.isEmpty && self.errorMessage.contains("API Key") {
+                    self.errorMessage = ""
+                }
+            } catch {
+                self.errorMessage = "Keychain error: \(error.localizedDescription)"
+                self.apiKey = ""
             }
         }
     }

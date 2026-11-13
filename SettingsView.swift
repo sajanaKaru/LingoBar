@@ -21,6 +21,7 @@ public struct SettingsView: View {
     @State private var initialKey: String = ""
     @State private var errorMessage: String = ""
     @State private var currentTestTask: URLSessionDataTask?
+    @State private var currentTestRequestId: UUID?
     @State private var lastTestedKey: String = ""
 
     public init(isPresented: Binding<Bool>, onKeySaved: (() -> Void)? = nil) {
@@ -223,12 +224,13 @@ public struct SettingsView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
 
+                // Save button requires validation before saving unless clearing key
                 Button("Save") {
                     saveKey()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .disabled(isTesting)
+                .disabled(isTesting || isSaveDisabled)
             }
         }
         .padding(18)
@@ -239,23 +241,30 @@ public struct SettingsView: View {
         }
     }
 
+    private var isSaveDisabled: Bool {
+        let trimmed = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return false // Allow saving empty to delete/clear
+        }
+        // Scope requirement: must be verified (.connected) before saving
+        return keyStatus != .connected
+    }
+
     private func cancelInFlightTest() {
+        currentTestRequestId = nil
         currentTestTask?.cancel()
         currentTestTask = nil
         isTesting = false
     }
 
     private func handleInputChanged(newKey: String) {
-        // Cancel in-flight test when user changes input to prevent race conditions
-        if isTesting {
-            cancelInFlightTest()
-        }
+        cancelInFlightTest()
 
         let trimmed = newKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             keyStatus = .notConfigured
         } else if trimmed == lastTestedKey && keyStatus == .connected {
-            // Key matches the one that was tested and connected
+            // Key matches the one currently tested and verified
         } else if trimmed == initialKey {
             keyStatus = .unverified
         } else {
@@ -312,6 +321,9 @@ public struct SettingsView: View {
         }
 
         cancelInFlightTest()
+
+        let requestId = UUID()
+        currentTestRequestId = requestId
         isTesting = true
         keyStatus = .testing
         errorMessage = ""
@@ -331,10 +343,15 @@ public struct SettingsView: View {
 
         let task = URLSession.shared.dataTask(with: request) { _, response, error in
             DispatchQueue.main.async {
+                // Generation ID validation to prevent stale callbacks and race conditions
+                guard self.currentTestRequestId == requestId else {
+                    return
+                }
+
                 self.isTesting = false
                 self.currentTestTask = nil
 
-                // Race condition check: Verify current text still matches the tested key
+                // Race condition check: Ensure the input text has not mutated
                 let currentTrimmed = self.enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard currentTrimmed == targetKey else {
                     return
@@ -384,9 +401,6 @@ public struct SettingsView: View {
             } else {
                 try KeychainHelper.shared.saveKey(trimmed)
                 initialKey = trimmed
-                if trimmed != lastTestedKey || keyStatus != .connected {
-                    keyStatus = .unverified
-                }
             }
             onKeySaved?()
             isPresented = false

@@ -33,7 +33,11 @@ public final class KeychainHelper {
     public static let defaultAccount = "GROQ_API_KEY"
     private static let migrationFlagKey = "com.lingobar.macos.hasMigratedLegacyKey"
 
-    private init() {}
+    private init() {
+        // Security Cleanup: Purge any residual unencrypted keys from previous builds
+        UserDefaults.standard.removeObject(forKey: "GROQ_API_KEY")
+        UserDefaults.standard.removeObject(forKey: "com.lingobar.macos.fallback_api_key")
+    }
 
     /// Saves or updates the API key in the macOS Keychain under the specified account and service.
     /// Throws KeychainError on failure. Never stores keys in unencrypted plaintext.
@@ -125,21 +129,21 @@ public final class KeychainHelper {
         if status != errSecSuccess && status != errSecItemNotFound {
             throw KeychainError.statusError(status)
         }
+        // Explicit deletion marks migration as completed so legacy key is not re-imported
+        UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
     }
 
     /// Performs a one-time migration from the legacy vault file if Keychain has no existing key.
-    /// A persistent boolean flag in UserDefaults ensures the legacy key is not re-imported if deleted.
-    public func migrateLegacyKeyIfNeeded(account: String = defaultAccount, service: String = defaultService) {
-        // If already migrated in a prior run, never re-import
+    /// Only marks the migration flag upon a successful Keychain write or if no legacy key exists.
+    public func migrateLegacyKeyIfNeeded(account: String = defaultAccount, service: String = defaultService) throws {
+        // If already marked as migrated or explicitly managed, return
         if UserDefaults.standard.bool(forKey: Self.migrationFlagKey) {
             return
         }
 
-        // Mark flag so future runs skip re-importing
-        UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
-
-        // If Keychain already contains a key, do not overwrite
-        if let existing = try? getKey(account: account, service: service), !existing.isEmpty {
+        // If Keychain already contains a valid key, mark flag and return
+        if let existing = try getKey(account: account, service: service), !existing.isEmpty {
+            UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
             return
         }
 
@@ -147,12 +151,19 @@ public final class KeychainHelper {
             .appendingPathComponent("Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY")
             .path
 
-        if FileManager.default.fileExists(atPath: legacyPath),
-           let raw = try? String(contentsOfFile: legacyPath, encoding: .utf8) {
+        if FileManager.default.fileExists(atPath: legacyPath) {
+            let raw = try String(contentsOfFile: legacyPath, encoding: .utf8)
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                try? saveKey(trimmed, account: account, service: service)
+                // Save key to Keychain. Flag is ONLY set after saveKey succeeds!
+                try saveKey(trimmed, account: account, service: service)
+                UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
+            } else {
+                UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
             }
+        } else {
+            // No legacy file exists
+            UserDefaults.standard.set(true, forKey: Self.migrationFlagKey)
         }
     }
 }

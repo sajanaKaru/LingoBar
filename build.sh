@@ -41,6 +41,8 @@ fi
 if [ -f "Resources/AppIcon.icns" ]; then
     echo "==> Installing AppIcon.icns..."
     cp -f Resources/AppIcon.icns "${RESOURCES_DIR}/AppIcon.icns"
+else
+    echo "==> Note: Resources/AppIcon.icns not found (skipping optional icon packaging)"
 fi
 
 echo "==> Signing ${APP_BUNDLE} with designated requirement..."
