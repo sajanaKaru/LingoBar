@@ -352,7 +352,19 @@ public struct SettingsView: View {
     }
 
     private func loadCurrentKey() {
+        isPerformingProgrammaticClear = true
+        defer {
+            isPerformingProgrammaticClear = false
+        }
+        cancelInFlightTest()
         errorMessage = ""
+        enteredKey = ""
+        initialKey = ""
+        lastTestedKey = ""
+        keyStatus = .notConfigured
+        pendingConflictCandidates = []
+        selectedConflictCandidate = nil
+
         do {
             if let key = try KeychainHelper.shared.getKey(account: selectedProvider.keychainAccount), !key.isEmpty {
                 enteredKey = key
@@ -376,13 +388,28 @@ public struct SettingsView: View {
                 isLegacyVaultAvailable = false
             }
         } catch {
-            errorMessage = error.localizedDescription
+            enteredKey = ""
+            initialKey = ""
+            lastTestedKey = ""
             keyStatus = .notConfigured
+            pendingConflictCandidates = []
+            selectedConflictCandidate = nil
+            errorMessage = "Keychain error: \(error.localizedDescription)"
         }
     }
 
     private func handleProviderChanged(to newProvider: AIProvider) {
         cancelInFlightTest()
+        isPerformingProgrammaticClear = true
+        enteredKey = ""
+        initialKey = ""
+        lastTestedKey = ""
+        keyStatus = .notConfigured
+        pendingConflictCandidates = []
+        selectedConflictCandidate = nil
+        errorMessage = ""
+        isPerformingProgrammaticClear = false
+
         selectedProvider = newProvider
         selectedModel = newProvider.selectedModel
         AIProvider.current = newProvider
@@ -542,6 +569,9 @@ public struct SettingsView: View {
     private func saveKey() {
         cancelInFlightTest()
         let trimmed = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !errorMessage.isEmpty && trimmed.isEmpty {
+            return
+        }
         errorMessage = ""
 
         if trimmed.isEmpty {
