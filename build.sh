@@ -38,11 +38,20 @@ if [ ! -f "${CONTENTS_DIR}/Info.plist" ]; then
     exit 1
 fi
 
+# Ensure AppIcon.icns exists and is installed
 if [ -f "Resources/AppIcon.icns" ]; then
     echo "==> Installing AppIcon.icns..."
     cp -f Resources/AppIcon.icns "${RESOURCES_DIR}/AppIcon.icns"
+elif [ -f "${RESOURCES_DIR}/AppIcon.icns" ]; then
+    echo "==> Retaining existing ${RESOURCES_DIR}/AppIcon.icns"
 else
-    echo "==> Note: Resources/AppIcon.icns not found (skipping optional icon packaging)"
+    echo "ERROR: Required icon file 'Resources/AppIcon.icns' is missing!" >&2
+    exit 1
+fi
+
+if [ ! -f "${RESOURCES_DIR}/AppIcon.icns" ]; then
+    echo "ERROR: Target '${RESOURCES_DIR}/AppIcon.icns' not found in bundle!" >&2
+    exit 1
 fi
 
 echo "==> Signing ${APP_BUNDLE} with designated requirement..."

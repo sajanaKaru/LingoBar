@@ -70,13 +70,15 @@ class AppViewModel: ObservableObject {
     @Published var polishTone: String = "Natural"
 
     @Published var apiKey: String = ""
+    @Published var storageError: String = ""
 
     init() {
         do {
             try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
             self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
+            self.storageError = ""
         } catch {
-            self.errorMessage = "Keychain error: \(error.localizedDescription)"
+            self.storageError = "Keychain error: \(error.localizedDescription)"
             self.apiKey = ""
         }
 
@@ -87,11 +89,12 @@ class AppViewModel: ObservableObject {
         DispatchQueue.main.async {
             do {
                 self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
-                if !self.apiKey.isEmpty && self.errorMessage.contains("API Key") {
+                self.storageError = ""
+                if self.errorMessage.contains("API Key") {
                     self.errorMessage = ""
                 }
             } catch {
-                self.errorMessage = "Keychain error: \(error.localizedDescription)"
+                self.storageError = "Keychain error: \(error.localizedDescription)"
                 self.apiKey = ""
             }
         }
@@ -110,7 +113,9 @@ class AppViewModel: ObservableObject {
     func runTranslate() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !apiKey.isEmpty else {
-            errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            if storageError.isEmpty {
+                errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            }
             return
         }
         isLoading = true
@@ -143,7 +148,9 @@ class AppViewModel: ObservableObject {
     func runPolish() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !apiKey.isEmpty else {
-            errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            if storageError.isEmpty {
+                errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            }
             return
         }
         isLoading = true
@@ -270,6 +277,21 @@ struct MainContentView: View {
                 .keyboardShortcut(",", modifiers: [.command])
             }
             .padding(.top, 4)
+
+            // Storage / Keychain Error Banner
+            if !vm.storageError.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.octagon.fill")
+                        .foregroundColor(.red)
+                    Text(vm.storageError)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.1))
+                .cornerRadius(6)
+            }
 
             // Empty State Banner when API Key is missing
             if vm.apiKey.isEmpty {
