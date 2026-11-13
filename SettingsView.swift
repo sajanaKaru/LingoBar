@@ -254,7 +254,7 @@ public struct SettingsView: View {
             // Footer Actions
             HStack {
                 if !enteredKey.isEmpty {
-                    Button(action: deleteStoredKey) {
+                    Button(action: { _ = deleteStoredKey() }) {
                         Text("Clear Key")
                             .foregroundColor(.red)
                     }
@@ -385,7 +385,8 @@ public struct SettingsView: View {
         }
     }
 
-    private func deleteStoredKey() {
+    @discardableResult
+    private func deleteStoredKey() -> Bool {
         cancelInFlightTest()
         errorMessage = ""
         defer {
@@ -400,8 +401,10 @@ public struct SettingsView: View {
         }
         do {
             try KeychainHelper.shared.deleteKey()
+            return true
         } catch {
             errorMessage = "Failed to delete key: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -486,8 +489,9 @@ public struct SettingsView: View {
         errorMessage = ""
 
         if trimmed.isEmpty {
-            deleteStoredKey()
-            isPresented = false
+            if deleteStoredKey() {
+                isPresented = false
+            }
             return
         }
 

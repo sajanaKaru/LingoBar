@@ -43,7 +43,7 @@ public final class KeychainHelper {
     private static let legacyMigrationFlagKey = "com.lingobar.macos.hasMigratedLegacyKey"
     private static let migrationV2FlagKey = "com.lingobar.macos.hasMigratedVaultV2"
     // Explicit deletion flag to respect intentional user key removal
-    private static let explicitDeletionFlagKey = "com.lingobar.macos.hasExplicitlyDeletedKey"
+    static let explicitDeletionFlagKey = "com.lingobar.macos.hasExplicitlyDeletedKey"
 
     public private(set) var fallbackRecoveryWarning: String? = nil
 
@@ -95,7 +95,17 @@ public final class KeychainHelper {
                 fallbackRecoveryWarning = nil
             } else {
                 // Conflict detected: primary key differs from candidate key.
-                // Do not silently tuck it away or delete it. Retain it so pendingFallbackConflictKey surfaces it in UI.
+                // Store the secret securely in Keychain under fallbackAccount and remove from plaintext UserDefaults!
+                do {
+                    try saveKey(secret, account: Self.fallbackAccount, service: service)
+                    for key in fallbackKeys {
+                        UserDefaults.standard.removeObject(forKey: key)
+                    }
+                    fallbackRecoveryWarning = "A conflicting key was found in local storage. Review in Settings."
+                } catch {
+                    fallbackRecoveryWarning = "Failed to secure conflicting key in Keychain: \(error.localizedDescription)"
+                    throw error
+                }
             }
         } else {
             // Keychain absence is confirmed: recover into default account
@@ -112,10 +122,11 @@ public final class KeychainHelper {
         }
     }
 
-    private func recoverFallbackKeysAndCleanup(service: String = defaultService) {
+    func recoverFallbackKeysAndCleanup(service: String = defaultService) {
         do {
             try recoverFallbackKeys(service: service)
         } catch {
+            fallbackRecoveryWarning = "Storage recovery error: \(error.localizedDescription)"
             NSLog("KeychainHelper fallback recovery failed with error: %@", error.localizedDescription)
         }
     }
@@ -268,19 +279,23 @@ public final class KeychainHelper {
             throw KeychainError.statusError(checkStatus)
         }
 
-        // When saving a primary key, explicitly purge any residual secondary/fallback Keychain item
-        // before clearing explicitDeletionFlagKey, ensuring no zombie credential remains from a prior partial delete.
-        if account == Self.defaultAccount {
+        // When saving a primary key:
+        // Only purge secondary/fallback account if explicitDeletionFlagKey is true (i.e. cleanup was pending from a prior user deletion).
+        // If explicitDeletionFlagKey is false, leave fallbackAccount intact so an unresolved conflict is not destroyed.
+        if account == Self.defaultAccount && UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
             let fallbackQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: Self.fallbackAccount
             ]
-            _ = SecItemDelete(fallbackQuery as CFDictionary)
+            let fallbackStatus = SecItemDelete(fallbackQuery as CFDictionary)
+            if fallbackStatus != errSecSuccess && fallbackStatus != errSecItemNotFound {
+                throw KeychainError.statusError(fallbackStatus)
+            }
+            UserDefaults.standard.removeObject(forKey: Self.explicitDeletionFlagKey)
+        } else if account == Self.defaultAccount {
+            UserDefaults.standard.removeObject(forKey: Self.explicitDeletionFlagKey)
         }
-
-        // Saving a valid key clears any prior explicit deletion flag
-        UserDefaults.standard.removeObject(forKey: Self.explicitDeletionFlagKey)
     }
 
     /// Retrieves the stored API key from the macOS Keychain.
