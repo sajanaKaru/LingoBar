@@ -704,6 +704,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
+    private var isTaskInFlight: Bool = false
     private var streamDataBuffer = Data()
     private var errorDataBuffer = Data()
     private var dismissWorkItem: DispatchWorkItem?
@@ -730,16 +731,27 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
+    func cancelInFlightTask() {
+        // Invalidate request ID first so any queued or concurrent delegate callbacks fail the match guard immediately
+        currentRequestId = UUID()
+        if isTaskInFlight || currentTask != nil {
+            currentTask?.cancel()
+            currentTask = nil
+            isTaskInFlight = false
+        }
+        isLoading = false
+        streamDataBuffer.removeAll()
+        errorDataBuffer.removeAll()
+    }
+
     func refreshApiKey() {
         DispatchQueue.main.async {
             let previousProvider = self.activeProvider
             let provider = AIProvider.current
             self.activeProvider = provider
 
-            if previousProvider != provider && self.isLoading {
-                self.currentTask?.cancel()
-                self.currentTask = nil
-                self.isLoading = false
+            if previousProvider != provider {
+                self.cancelInFlightTask()
             }
 
             do {
@@ -764,16 +776,11 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     func resetToEmptyState() {
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        currentTask?.cancel()
-        currentTask = nil
-        currentRequestId = UUID()
-        streamDataBuffer.removeAll()
-        errorDataBuffer.removeAll()
+        cancelInFlightTask()
         responseStatusCode = 200
         isEventStream = false
         receivedDone = false
         hadStreamParseError = false
-        isLoading = false
         inputText = ""
         outputText = ""
         errorMessage = ""
@@ -786,7 +793,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        currentTask?.cancel()
+        cancelInFlightTask()
 
         let provider = AIProvider.current
         self.activeProvider = provider
@@ -796,7 +803,6 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         let key: String
         do {
             guard let retrieved = try KeychainHelper.shared.getKey(account: provider.keychainAccount), !retrieved.isEmpty else {
-                self.isLoading = false
                 self.apiKey = ""
                 self.errorMessage = "\(provider.displayName) API Key not configured. Please open Settings (⌘,) to configure."
                 return
@@ -804,7 +810,6 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             key = retrieved
             self.apiKey = retrieved
         } catch {
-            self.isLoading = false
             self.apiKey = ""
             self.errorMessage = "Keychain error accessing \(provider.displayName) API Key: \(error.localizedDescription)"
             return
@@ -816,6 +821,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         let requestId = UUID()
         currentRequestId = requestId
         isLoading = true
+        isTaskInFlight = true
         errorMessage = ""
         outputText = ""
         copied = false
@@ -866,7 +872,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        currentTask?.cancel()
+        cancelInFlightTask()
 
         let provider = AIProvider.current
         self.activeProvider = provider
@@ -876,7 +882,6 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         let key: String
         do {
             guard let retrieved = try KeychainHelper.shared.getKey(account: provider.keychainAccount), !retrieved.isEmpty else {
-                self.isLoading = false
                 self.apiKey = ""
                 self.errorMessage = "\(provider.displayName) API Key not configured. Please open Settings (⌘,) to configure."
                 return
@@ -884,7 +889,6 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             key = retrieved
             self.apiKey = retrieved
         } catch {
-            self.isLoading = false
             self.apiKey = ""
             self.errorMessage = "Keychain error accessing \(provider.displayName) API Key: \(error.localizedDescription)"
             return
@@ -896,6 +900,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         let requestId = UUID()
         currentRequestId = requestId
         isLoading = true
+        isTaskInFlight = true
         errorMessage = ""
         outputText = ""
         copied = false
@@ -990,10 +995,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 // 2xx status but not streaming response: cancel task immediately to stop data receipt
                 let name = self.requestProvider.displayName
                 self.errorMessage = "\(name) API error: Unexpected non-streaming response."
-                self.isLoading = false
-                self.currentRequestId = UUID()
-                self.streamDataBuffer.removeAll()
-                self.errorDataBuffer.removeAll()
+                self.cancelInFlightTask()
                 completionHandler(.cancel)
                 return
             }
@@ -1028,11 +1030,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
             // Check individual line size limit before decoding
             if lineData.count > maxStreamBufferSize {
-                dataTask.cancel()
-                self.currentRequestId = UUID()
                 self.errorMessage = "Line exceeded maximum allowed size."
-                self.isLoading = false
-                self.streamDataBuffer.removeAll()
+                self.cancelInFlightTask()
                 return
             }
 
@@ -1047,11 +1046,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         // Check remaining tail buffer size after draining all complete lines
         if streamDataBuffer.count > maxStreamBufferSize {
-            dataTask.cancel()
-            self.currentRequestId = UUID()
             self.errorMessage = "Stream buffer tail exceeded maximum allowed size."
-            self.isLoading = false
-            self.streamDataBuffer.removeAll()
+            self.cancelInFlightTask()
             return
         }
     }
@@ -1084,7 +1080,7 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 } else {
                     self.errorMessage = "\(name) API error: \(msg)"
                 }
-                self.isLoading = false
+                self.cancelInFlightTask()
                 return
             }
 
@@ -1106,6 +1102,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             return
         }
 
+        self.isTaskInFlight = false
+        self.currentTask = nil
         self.isLoading = false
 
         if let error = error as NSError? {

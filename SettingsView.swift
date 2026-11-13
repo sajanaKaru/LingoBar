@@ -23,6 +23,7 @@ public struct SettingsView: View {
     @State private var errorMessage: String = ""
     @State private var currentTestTask: URLSessionDataTask?
     @State private var currentTestRequestId: UUID?
+    @State private var currentTestTimeoutWorkItem: DispatchWorkItem?
     @State private var lastTestedKey: String = ""
     @State private var pendingConflictCandidates: [ConflictCandidate] = []
     @State private var selectedConflictCandidate: ConflictCandidate? = nil
@@ -328,6 +329,8 @@ public struct SettingsView: View {
 
     private func cancelInFlightTest() {
         currentTestRequestId = nil
+        currentTestTimeoutWorkItem?.cancel()
+        currentTestTimeoutWorkItem = nil
         currentTestTask?.cancel()
         currentTestTask = nil
         isTesting = false
@@ -512,7 +515,29 @@ public struct SettingsView: View {
         request.httpMethod = "GET"
         request.setValue("Bearer \(targetKey)", forHTTPHeaderField: "Authorization")
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 5.0
+        request.timeoutInterval = 3.0
+
+        let timeoutWorkItem = DispatchWorkItem { [targetKey, targetProvider] in
+            guard self.currentTestRequestId == requestId else {
+                return
+            }
+            self.currentTestTimeoutWorkItem = nil
+            self.currentTestTask?.cancel()
+            self.currentTestTask = nil
+            self.isTesting = false
+
+            guard self.selectedProvider == targetProvider else {
+                return
+            }
+            let currentTrimmed = self.enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard currentTrimmed == targetKey else {
+                return
+            }
+
+            self.keyStatus = .invalid("Connection timed out (3s)")
+        }
+        self.currentTestTimeoutWorkItem = timeoutWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: timeoutWorkItem)
 
         let task = URLSession.shared.dataTask(with: request) { _, response, error in
             DispatchQueue.main.async {
@@ -521,6 +546,8 @@ public struct SettingsView: View {
                     return
                 }
 
+                self.currentTestTimeoutWorkItem?.cancel()
+                self.currentTestTimeoutWorkItem = nil
                 self.isTesting = false
                 self.currentTestTask = nil
 
@@ -538,7 +565,7 @@ public struct SettingsView: View {
                     if nsErr.code == NSURLErrorCancelled {
                         return
                     } else if nsErr.code == NSURLErrorTimedOut {
-                        self.keyStatus = .invalid("Connection timed out (5s)")
+                        self.keyStatus = .invalid("Connection timed out (3s)")
                     } else {
                         self.keyStatus = .invalid("Network error")
                     }
