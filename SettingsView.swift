@@ -521,6 +521,7 @@ public struct SettingsView: View {
             guard self.currentTestRequestId == requestId else {
                 return
             }
+            self.currentTestRequestId = nil
             self.currentTestTimeoutWorkItem = nil
             self.currentTestTask?.cancel()
             self.currentTestTask = nil
