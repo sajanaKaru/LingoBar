@@ -24,6 +24,7 @@ public struct SettingsView: View {
     @State private var currentTestRequestId: UUID?
     @State private var lastTestedKey: String = ""
     @State private var pendingConflictKey: String? = nil
+    @State private var selectedConflictKey: String? = nil
     @State private var isLegacyVaultAvailable: Bool = false
 
     public init(isPresented: Binding<Bool>, onKeySaved: (() -> Void)? = nil) {
@@ -253,7 +254,7 @@ public struct SettingsView: View {
             // Footer Actions
             HStack {
                 if !enteredKey.isEmpty {
-                    Button(action: clearKey) {
+                    Button(action: deleteStoredKey) {
                         Text("Clear Key")
                             .foregroundColor(.red)
                     }
@@ -346,6 +347,7 @@ public struct SettingsView: View {
         enteredKey = key
         lastTestedKey = ""
         keyStatus = .unverified
+        selectedConflictKey = key
         pendingConflictKey = nil
     }
 
@@ -383,7 +385,7 @@ public struct SettingsView: View {
         }
     }
 
-    private func clearKey() {
+    private func deleteStoredKey() {
         cancelInFlightTest()
         errorMessage = ""
         defer {
@@ -392,6 +394,7 @@ public struct SettingsView: View {
             lastTestedKey = ""
             keyStatus = .notConfigured
             pendingConflictKey = nil
+            selectedConflictKey = nil
             isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
             onKeySaved?()
         }
@@ -482,20 +485,20 @@ public struct SettingsView: View {
         let trimmed = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
         errorMessage = ""
 
+        if trimmed.isEmpty {
+            deleteStoredKey()
+            isPresented = false
+            return
+        }
+
         do {
-            if trimmed.isEmpty {
-                try KeychainHelper.shared.deleteKey()
-                initialKey = ""
-                keyStatus = .notConfigured
-            } else {
-                try KeychainHelper.shared.saveKey(trimmed)
-                initialKey = trimmed
-                if let conflict = pendingConflictKey, trimmed == conflict {
-                    try? KeychainHelper.shared.discardFallbackConflict()
-                    pendingConflictKey = nil
-                }
-                UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
+            try KeychainHelper.shared.saveKey(trimmed)
+            initialKey = trimmed
+            if let selected = selectedConflictKey, trimmed == selected {
+                try KeychainHelper.shared.discardFallbackConflict()
+                selectedConflictKey = nil
             }
+            UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
             isLegacyVaultAvailable = false
             onKeySaved?()
             isPresented = false

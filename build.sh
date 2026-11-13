@@ -48,6 +48,8 @@ codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated
 echo "==> Verifying signature on staged bundle before promotion..."
 codesign --verify --deep --strict "${STAGING_DIR}"
 
+BACKUP_BUNDLE="${APP_BUNDLE}.backup.$$"
+
 echo "==> Preparing rollback-safe swap with signal-aware trap handlers..."
 
 cleanup() {
@@ -59,24 +61,24 @@ cleanup() {
         exit_code=143
     fi
 
-    if [ -d "${APP_BUNDLE}.old" ]; then
+    if [ -d "${BACKUP_BUNDLE}" ]; then
         echo "ERROR: Bundle swap or verification failed (signal/status: ${sig}, exit code: ${exit_code})! Rolling back from backup..." >&2
         rm -rf "${APP_BUNDLE}"
-        mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
+        mv "${BACKUP_BUNDLE}" "${APP_BUNDLE}"
         echo "==> Rollback complete: Restored previous ${APP_BUNDLE}" >&2
     fi
     rm -rf ".build_staging"
     exit "${exit_code}"
 }
 
-# Arm traps for ERR, INT, TERM before moving APP_BUNDLE to APP_BUNDLE.old
+# Arm traps for ERR, INT, TERM before moving APP_BUNDLE to BACKUP_BUNDLE
 trap 'cleanup 0' ERR
 trap 'cleanup 2' INT
 trap 'cleanup 15' TERM
 
 if [ -d "${APP_BUNDLE}" ]; then
-    rm -rf "${APP_BUNDLE}.old"
-    mv "${APP_BUNDLE}" "${APP_BUNDLE}.old"
+    rm -rf "${BACKUP_BUNDLE}"
+    mv "${APP_BUNDLE}" "${BACKUP_BUNDLE}"
 fi
 
 echo "==> Promoting staged bundle to ${APP_BUNDLE}..."
@@ -90,6 +92,6 @@ codesign --verify --deep --strict "${APP_BUNDLE}"
 trap - ERR INT TERM
 
 # Cleanup backup only after post-promotion verification passes
-rm -rf "${APP_BUNDLE}.old" ".build_staging"
+rm -rf "${BACKUP_BUNDLE}" ".build_staging"
 
 echo "==> Build, packaging, and verification complete: ${APP_BUNDLE}"

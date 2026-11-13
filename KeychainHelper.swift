@@ -268,6 +268,17 @@ public final class KeychainHelper {
             throw KeychainError.statusError(checkStatus)
         }
 
+        // When saving a primary key, explicitly purge any residual secondary/fallback Keychain item
+        // before clearing explicitDeletionFlagKey, ensuring no zombie credential remains from a prior partial delete.
+        if account == Self.defaultAccount {
+            let fallbackQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: Self.fallbackAccount
+            ]
+            _ = SecItemDelete(fallbackQuery as CFDictionary)
+        }
+
         // Saving a valid key clears any prior explicit deletion flag
         UserDefaults.standard.removeObject(forKey: Self.explicitDeletionFlagKey)
     }
