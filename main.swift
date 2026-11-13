@@ -20,7 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let contentView = MainContentView()
 
-        popover.contentSize = NSSize(width: 440, height: 420)
+        popover.contentSize = NSSize(width: 440, height: 460)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: contentView)
 
@@ -69,17 +69,22 @@ class AppViewModel: ObservableObject {
     // Tone for polishing
     @Published var polishTone: String = "Natural"
 
-    private let apiKey: String
+    @Published var apiKey: String = ""
 
     init() {
-        let keyPath = "/Users/sajanakarunarathna/Library/Application Support/OpenBot/agent-api-keys/.vault/GROQ_API_KEY"
-        if let key = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
-            self.apiKey = key
-        } else {
-            self.apiKey = ""
-        }
+        KeychainHelper.shared.migrateLegacyKeyIfNeeded()
+        self.apiKey = KeychainHelper.shared.getKey() ?? ""
 
         NotificationCenter.default.addObserver(self, selector: #selector(handleOpen), name: NSNotification.Name("PopoverOpened"), object: nil)
+    }
+
+    func refreshApiKey() {
+        DispatchQueue.main.async {
+            self.apiKey = KeychainHelper.shared.getKey() ?? ""
+            if !self.apiKey.isEmpty && self.errorMessage.contains("API Key") {
+                self.errorMessage = ""
+            }
+        }
     }
 
     @objc func handleOpen() {
@@ -94,6 +99,10 @@ class AppViewModel: ObservableObject {
 
     func runTranslate() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !apiKey.isEmpty else {
+            errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            return
+        }
         isLoading = true
         errorMessage = ""
         outputText = ""
@@ -123,6 +132,10 @@ class AppViewModel: ObservableObject {
 
     func runPolish() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !apiKey.isEmpty else {
+            errorMessage = "API Key not configured. Please open Settings (⌘,) to configure."
+            return
+        }
         isLoading = true
         errorMessage = ""
         outputText = ""
@@ -152,7 +165,7 @@ class AppViewModel: ObservableObject {
 
     private func callGroq(prompt: String, completion: @escaping (Result<String, Error>) -> Void) {
         guard !apiKey.isEmpty else {
-            completion(.failure(NSError(domain: "LingoBar", code: 401, userInfo: [NSLocalizedDescriptionKey: "Groq API Key not found."])))
+            completion(.failure(NSError(domain: "LingoBar", code: 401, userInfo: [NSLocalizedDescriptionKey: "Groq API Key not found. Please configure it in Settings (⌘,)."])))
             return
         }
 
@@ -219,6 +232,7 @@ class AppViewModel: ObservableObject {
 
 struct MainContentView: View {
     @StateObject var vm = AppViewModel()
+    @State private var showSettings: Bool = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -234,8 +248,52 @@ struct MainContentView: View {
                     .padding(.vertical, 2)
                     .background(Color.secondary.opacity(0.15))
                     .cornerRadius(4)
+
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                        .padding(4)
+                }
+                .buttonStyle(.plain)
+                .help("Settings (⌘,)")
+                .keyboardShortcut(",", modifiers: [.command])
             }
             .padding(.top, 4)
+
+            // Empty State Banner when API Key is missing
+            if vm.apiKey.isEmpty {
+                VStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "key.fill")
+                            .foregroundColor(.orange)
+                        Text("API Key Not Configured")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    Text("Configure your Groq API key in Settings to enable AI translation and polishing.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button(action: { showSettings = true }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "gearshape.fill")
+                            Text("Configure API Key")
+                        }
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+                )
+            }
 
             // Tab Picker
             Picker("", selection: $vm.selectedTab) {
@@ -307,7 +365,9 @@ struct MainContentView: View {
                 Spacer()
 
                 Button(action: {
-                    if vm.selectedTab == .translate {
+                    if vm.apiKey.isEmpty {
+                        showSettings = true
+                    } else if vm.selectedTab == .translate {
                         vm.runTranslate()
                     } else {
                         vm.runPolish()
@@ -317,13 +377,13 @@ struct MainContentView: View {
                         ProgressView().controlSize(.small)
                             .padding(.horizontal, 8)
                     } else {
-                        Text(vm.selectedTab == .translate ? "Translate to සිංහල" : "Polish English")
+                        Text(vm.apiKey.isEmpty ? "Configure Key" : (vm.selectedTab == .translate ? "Translate to සිංහල" : "Polish English"))
                             .fontWeight(.semibold)
                     }
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(vm.isLoading || vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(vm.isLoading || (!vm.apiKey.isEmpty && vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
 
             // Output Area
@@ -386,6 +446,11 @@ struct MainContentView: View {
             .padding(.bottom, 2)
         }
         .padding(14)
-        .frame(width: 440, height: 420)
+        .frame(width: 440)
+        .sheet(isPresented: $showSettings) {
+            SettingsView(isPresented: $showSettings, onKeySaved: {
+                vm.refreshApiKey()
+            })
+        }
     }
 }
