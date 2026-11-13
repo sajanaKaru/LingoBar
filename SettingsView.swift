@@ -581,8 +581,10 @@ public struct SettingsView: View {
                 if httpResponse.statusCode == 200 {
                     self.keyStatus = .connected
                     self.lastTestedKey = targetKey
-                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                } else if httpResponse.statusCode == 401 {
                     self.keyStatus = .invalid("Invalid Key (401)")
+                } else if httpResponse.statusCode == 403 {
+                    self.keyStatus = .invalid("Access Forbidden (403)")
                 } else if httpResponse.statusCode == 429 {
                     self.keyStatus = .invalid("Quota / Rate Limit (429)")
                 } else {
