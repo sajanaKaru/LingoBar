@@ -48,13 +48,19 @@ codesign --force --deep -s - -i "com.lingobar.macos" --requirements '=designated
 echo "==> Verifying signature on staged bundle before promotion..."
 codesign --verify --deep --strict "${STAGING_DIR}"
 
-echo "==> Preparing rollback-safe swap with trap handler..."
-HAS_OLD=0
+echo "==> Preparing rollback-safe swap with signal-aware trap handlers..."
 
 cleanup() {
-    local exit_code=$?
-    echo "ERROR: Bundle swap or verification failed (exit code: ${exit_code})! Rolling back from backup..." >&2
-    if [ "${HAS_OLD}" -eq 1 ] && [ -d "${APP_BUNDLE}.old" ]; then
+    local sig="${1:-0}"
+    local exit_code=1
+    if [ "${sig}" -eq 2 ]; then
+        exit_code=130
+    elif [ "${sig}" -eq 15 ]; then
+        exit_code=143
+    fi
+
+    if [ -d "${APP_BUNDLE}.old" ]; then
+        echo "ERROR: Bundle swap or verification failed (signal/status: ${sig}, exit code: ${exit_code})! Rolling back from backup..." >&2
         rm -rf "${APP_BUNDLE}"
         mv "${APP_BUNDLE}.old" "${APP_BUNDLE}"
         echo "==> Rollback complete: Restored previous ${APP_BUNDLE}" >&2
@@ -63,13 +69,14 @@ cleanup() {
     exit "${exit_code}"
 }
 
-# Arm trap for EXIT, INT, TERM before moving APP_BUNDLE to APP_BUNDLE.old
-trap cleanup EXIT INT TERM
+# Arm traps for ERR, INT, TERM before moving APP_BUNDLE to APP_BUNDLE.old
+trap 'cleanup 0' ERR
+trap 'cleanup 2' INT
+trap 'cleanup 15' TERM
 
 if [ -d "${APP_BUNDLE}" ]; then
     rm -rf "${APP_BUNDLE}.old"
     mv "${APP_BUNDLE}" "${APP_BUNDLE}.old"
-    HAS_OLD=1
 fi
 
 echo "==> Promoting staged bundle to ${APP_BUNDLE}..."
@@ -79,13 +86,10 @@ mv "${STAGING_DIR}" "${APP_BUNDLE}"
 echo "==> Verifying promoted bundle signature..."
 codesign --verify --deep --strict "${APP_BUNDLE}"
 
-# Disarm trap only after post-promotion verification successfully passes
-trap - EXIT INT TERM
+# Disarm traps only after post-promotion verification successfully passes
+trap - ERR INT TERM
 
 # Cleanup backup only after post-promotion verification passes
-if [ "${HAS_OLD}" -eq 1 ]; then
-    rm -rf "${APP_BUNDLE}.old"
-fi
-rm -rf ".build_staging"
+rm -rf "${APP_BUNDLE}.old" ".build_staging"
 
 echo "==> Build, packaging, and verification complete: ${APP_BUNDLE}"

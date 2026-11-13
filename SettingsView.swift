@@ -386,8 +386,7 @@ public struct SettingsView: View {
     private func clearKey() {
         cancelInFlightTest()
         errorMessage = ""
-        do {
-            try KeychainHelper.shared.deleteKey()
+        defer {
             enteredKey = ""
             initialKey = ""
             lastTestedKey = ""
@@ -395,6 +394,9 @@ public struct SettingsView: View {
             pendingConflictKey = nil
             isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
             onKeySaved?()
+        }
+        do {
+            try KeychainHelper.shared.deleteKey()
         } catch {
             errorMessage = "Failed to delete key: \(error.localizedDescription)"
         }
@@ -488,11 +490,13 @@ public struct SettingsView: View {
             } else {
                 try KeychainHelper.shared.saveKey(trimmed)
                 initialKey = trimmed
-                try? KeychainHelper.shared.discardFallbackConflict()
+                if let conflict = pendingConflictKey, trimmed == conflict {
+                    try? KeychainHelper.shared.discardFallbackConflict()
+                    pendingConflictKey = nil
+                }
                 UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
             }
             isLegacyVaultAvailable = false
-            pendingConflictKey = nil
             onKeySaved?()
             isPresented = false
         } catch {

@@ -273,8 +273,12 @@ public final class KeychainHelper {
     }
 
     /// Retrieves the stored API key from the macOS Keychain.
-    /// Returns nil if item does not exist, or throws KeychainError on system failure.
+    /// Returns nil if item does not exist or was explicitly deleted, or throws KeychainError on system failure.
     public func getKey(account: String = defaultAccount, service: String = defaultService) throws -> String? {
+        if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
+            return nil
+        }
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

@@ -299,6 +299,21 @@ struct MainContentView: View {
                 .cornerRadius(6)
             }
 
+            // Fallback Recovery Warning Banner
+            if !vm.fallbackWarning.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(vm.fallbackWarning)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(6)
+            }
+
             // Empty State Banner when API Key is missing
             if vm.apiKey.isEmpty {
                 VStack(spacing: 8) {
