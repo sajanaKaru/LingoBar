@@ -695,12 +695,16 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var hotKeyConflictMessage: String = ""
 
     @Published var apiKey: String = ""
+    @Published var activeProvider: AIProvider = AIProvider.current
     @Published var storageError: String = ""
     @Published var fallbackWarning: String = ""
+    @Published var loadingPlaceholder: String = "Translating to spoken Sinhala..."
 
+    private var requestProvider: AIProvider = AIProvider.current
     private var session: URLSession!
     private var currentTask: URLSessionDataTask?
     private var currentRequestId: UUID = UUID()
+    private var isTaskInFlight: Bool = false
     private var streamDataBuffer = Data()
     private var errorDataBuffer = Data()
     private var dismissWorkItem: DispatchWorkItem?
@@ -712,8 +716,11 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         super.init()
         do {
             try KeychainHelper.shared.migrateLegacyKeyIfNeeded()
-            self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
-            self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+            let provider = AIProvider.current
+            self.activeProvider = provider
+            self.requestProvider = provider
+            self.apiKey = (try KeychainHelper.shared.getKey(account: provider.keychainAccount)) ?? ""
+            self.fallbackWarning = (provider == .groq) ? (KeychainHelper.shared.fallbackRecoveryWarning ?? "") : ""
         } catch {
             self.storageError = "Keychain error: \(error.localizedDescription)"
             self.apiKey = ""
@@ -724,11 +731,32 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
+    func cancelInFlightTask() {
+        // Invalidate request ID first so any queued or concurrent delegate callbacks fail the match guard immediately
+        currentRequestId = UUID()
+        if isTaskInFlight || currentTask != nil {
+            currentTask?.cancel()
+            currentTask = nil
+            isTaskInFlight = false
+        }
+        isLoading = false
+        streamDataBuffer.removeAll()
+        errorDataBuffer.removeAll()
+    }
+
     func refreshApiKey() {
         DispatchQueue.main.async {
+            let previousProvider = self.activeProvider
+            let provider = AIProvider.current
+            self.activeProvider = provider
+
+            if previousProvider != provider {
+                self.cancelInFlightTask()
+            }
+
             do {
-                self.apiKey = (try KeychainHelper.shared.getKey()) ?? ""
-                self.fallbackWarning = KeychainHelper.shared.fallbackRecoveryWarning ?? ""
+                self.apiKey = (try KeychainHelper.shared.getKey(account: provider.keychainAccount)) ?? ""
+                self.fallbackWarning = (provider == .groq) ? (KeychainHelper.shared.fallbackRecoveryWarning ?? "") : ""
                 self.storageError = ""
                 if self.errorMessage.contains("API Key") {
                     self.errorMessage = ""
@@ -748,16 +776,11 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
     func resetToEmptyState() {
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        currentTask?.cancel()
-        currentTask = nil
-        currentRequestId = UUID()
-        streamDataBuffer.removeAll()
-        errorDataBuffer.removeAll()
+        cancelInFlightTask()
         responseStatusCode = 200
         isEventStream = false
         receivedDone = false
         hadStreamParseError = false
-        isLoading = false
         inputText = ""
         outputText = ""
         errorMessage = ""
@@ -770,11 +793,35 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        currentTask?.cancel()
+        cancelInFlightTask()
+
+        let provider = AIProvider.current
+        self.activeProvider = provider
+        self.requestProvider = provider
+        self.loadingPlaceholder = "Translating to spoken Sinhala..."
+
+        let key: String
+        do {
+            guard let retrieved = try KeychainHelper.shared.getKey(account: provider.keychainAccount), !retrieved.isEmpty else {
+                self.apiKey = ""
+                self.errorMessage = "\(provider.displayName) API Key not configured. Please open Settings (⌘,) to configure."
+                return
+            }
+            key = retrieved
+            self.apiKey = retrieved
+        } catch {
+            self.apiKey = ""
+            self.errorMessage = "Keychain error accessing \(provider.displayName) API Key: \(error.localizedDescription)"
+            return
+        }
+
+        let model = provider.selectedModel
+        let url = provider.chatEndpoint
 
         let requestId = UUID()
         currentRequestId = requestId
         isLoading = true
+        isTaskInFlight = true
         errorMessage = ""
         outputText = ""
         copied = false
@@ -785,18 +832,6 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         receivedDone = false
         streamDataBuffer.removeAll()
         errorDataBuffer.removeAll()
-
-        guard !apiKey.isEmpty else {
-            self.isLoading = false
-            self.errorMessage = "Groq API Key not configured. Please open Settings (⌘,) to configure."
-            return
-        }
-
-        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
-            self.isLoading = false
-            self.errorMessage = "Invalid API endpoint URL."
-            return
-        }
 
         let prompt = """
         You are an expert English-to-Sinhala translator focused on zero-friction natural clarity.
@@ -812,11 +847,90 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body: [String: Any] = [
-            "model": "openai/gpt-oss-120b",
+            "model": model,
+            "messages": [
+                ["role": "user", "content": prompt]
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1024,
+            "stream": true
+        ]
+
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let task = session.dataTask(with: request)
+        task.taskDescription = requestId.uuidString
+        self.currentTask = task
+        task.resume()
+    }
+
+    func runPolish(tone: String = "natural") {
+        guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        dismissWorkItem?.cancel()
+        dismissWorkItem = nil
+        cancelInFlightTask()
+
+        let provider = AIProvider.current
+        self.activeProvider = provider
+        self.requestProvider = provider
+        self.loadingPlaceholder = "Polishing text (\(tone))..."
+
+        let key: String
+        do {
+            guard let retrieved = try KeychainHelper.shared.getKey(account: provider.keychainAccount), !retrieved.isEmpty else {
+                self.apiKey = ""
+                self.errorMessage = "\(provider.displayName) API Key not configured. Please open Settings (⌘,) to configure."
+                return
+            }
+            key = retrieved
+            self.apiKey = retrieved
+        } catch {
+            self.apiKey = ""
+            self.errorMessage = "Keychain error accessing \(provider.displayName) API Key: \(error.localizedDescription)"
+            return
+        }
+
+        let model = provider.selectedModel
+        let url = provider.chatEndpoint
+
+        let requestId = UUID()
+        currentRequestId = requestId
+        isLoading = true
+        isTaskInFlight = true
+        errorMessage = ""
+        outputText = ""
+        copied = false
+        isTruncated = false
+        hadStreamParseError = false
+        responseStatusCode = 200
+        isEventStream = false
+        receivedDone = false
+        streamDataBuffer.removeAll()
+        errorDataBuffer.removeAll()
+
+        let prompt = """
+        You are an expert English writing assistant and editor.
+        Polish and refine the following text for \(tone) clarity, grammar, and natural flow.
+        Strict Guidelines:
+        - Output ONLY the polished text.
+        - Do NOT include any explanations, greetings, quotes, or notes.
+        - Preserve the original meaning and tone while making it fluent and error-free.
+
+        Text to polish:
+        \"\"\"\(inputText)\"\"\"
+        """
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "model": model,
             "messages": [
                 ["role": "user", "content": prompt]
             ],
@@ -868,21 +982,28 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             if !(200...299).contains(code) {
                 // Non-2xx HTTP error status
                 self.isLoading = false
+                let name = self.requestProvider.displayName
                 switch code {
+                case 400:
+                    if self.requestProvider == .gemini {
+                        self.errorMessage = "\(name) API error (400): Invalid or unauthorized API key."
+                    } else {
+                        self.errorMessage = "\(name) API error (400): Bad request."
+                    }
                 case 401:
-                    self.errorMessage = "Groq API error (401): Invalid or unauthorized API key."
+                    self.errorMessage = "\(name) API error (401): Invalid or unauthorized API key."
+                case 403:
+                    self.errorMessage = "\(name) API error (403): Access forbidden or restricted API key."
                 case 429:
-                    self.errorMessage = "Groq API error (429): Rate limit exceeded. Try again shortly."
+                    self.errorMessage = "\(name) API error (429): Rate limit or quota exceeded. Try again shortly."
                 default:
-                    self.errorMessage = "Groq API error (\(code)): Unable to complete translation."
+                    self.errorMessage = "\(name) API error (\(code)): Unable to complete request."
                 }
             } else if !self.isEventStream {
                 // 2xx status but not streaming response: cancel task immediately to stop data receipt
-                self.errorMessage = "Groq API error: Unexpected non-streaming response."
-                self.isLoading = false
-                self.currentRequestId = UUID()
-                self.streamDataBuffer.removeAll()
-                self.errorDataBuffer.removeAll()
+                let name = self.requestProvider.displayName
+                self.errorMessage = "\(name) API error: Unexpected non-streaming response."
+                self.cancelInFlightTask()
                 completionHandler(.cancel)
                 return
             }
@@ -917,11 +1038,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
             // Check individual line size limit before decoding
             if lineData.count > maxStreamBufferSize {
-                dataTask.cancel()
-                self.currentRequestId = UUID()
                 self.errorMessage = "Line exceeded maximum allowed size."
-                self.isLoading = false
-                self.streamDataBuffer.removeAll()
+                self.cancelInFlightTask()
                 return
             }
 
@@ -936,11 +1054,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         // Check remaining tail buffer size after draining all complete lines
         if streamDataBuffer.count > maxStreamBufferSize {
-            dataTask.cancel()
-            self.currentRequestId = UUID()
             self.errorMessage = "Stream buffer tail exceeded maximum allowed size."
-            self.isLoading = false
-            self.streamDataBuffer.removeAll()
+            self.cancelInFlightTask()
             return
         }
     }
@@ -965,8 +1080,23 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
             // Check for API-level error returned within stream
             if let errorObj = json["error"] as? [String: Any], let msg = errorObj["message"] as? String {
-                self.errorMessage = msg
-                self.isLoading = false
+                let code = errorObj["code"] as? String
+                let name = self.requestProvider.displayName
+                if code == "insufficient_quota" || msg.lowercased().contains("quota") {
+                    let billingUrl: String
+                    switch self.requestProvider {
+                    case .openAI:
+                        billingUrl = "platform.openai.com/account/billing"
+                    case .gemini:
+                        billingUrl = "aistudio.google.com"
+                    case .groq:
+                        billingUrl = "console.groq.com"
+                    }
+                    self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
+                } else {
+                    self.errorMessage = "\(name) API error: \(msg)"
+                }
+                self.cancelInFlightTask()
                 return
             }
 
@@ -988,6 +1118,8 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
             return
         }
 
+        self.isTaskInFlight = false
+        self.currentTask = nil
         self.isLoading = false
 
         if let error = error as NSError? {
@@ -998,11 +1130,26 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
 
         // If non-2xx status, parse the accumulated complete JSON error body
         if !(200...299).contains(responseStatusCode) {
+            let name = self.requestProvider.displayName
             if !errorDataBuffer.isEmpty,
                let json = try? JSONSerialization.jsonObject(with: errorDataBuffer) as? [String: Any],
-               let errorObj = json["error"] as? [String: Any],
-               let msg = errorObj["message"] as? String {
-                self.errorMessage = "Groq API error (\(responseStatusCode)): \(msg)"
+               let errorObj = json["error"] as? [String: Any] {
+                let code = errorObj["code"] as? String
+                let msg = errorObj["message"] as? String ?? "Unable to complete request."
+                if code == "insufficient_quota" || msg.lowercased().contains("quota") {
+                    let billingUrl: String
+                    switch self.requestProvider {
+                    case .openAI:
+                        billingUrl = "platform.openai.com/account/billing"
+                    case .gemini:
+                        billingUrl = "aistudio.google.com"
+                    case .groq:
+                        billingUrl = "console.groq.com"
+                    }
+                    self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
+                } else {
+                    self.errorMessage = "\(name) API error (\(responseStatusCode)): \(msg)"
+                }
             }
             errorDataBuffer.removeAll()
             return
@@ -1021,9 +1168,9 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
         // Validate stream completeness for successful HTTP responses
         if (200...299).contains(responseStatusCode) && errorMessage.isEmpty {
             if outputText.isEmpty {
-                self.errorMessage = "Translation stream completed with empty output."
+                self.errorMessage = "Stream completed with empty output."
             } else if !receivedDone {
-                self.errorMessage = "Translation stream interrupted before completion."
+                self.errorMessage = "Stream interrupted before completion."
             }
         }
     }
@@ -1106,7 +1253,7 @@ struct InlinePopoverView: View {
                         .foregroundColor(.orange)
                         .font(.system(size: 11))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("AI API Key not configured.")
+                        Text("\(vm.activeProvider.displayName) API Key not configured.")
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundColor(.orange)
                         Button("Configure in Settings (⌘,)") {
@@ -1207,7 +1354,7 @@ struct InlinePopoverView: View {
                             .foregroundColor(.red)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     } else if vm.outputText.isEmpty && vm.isLoading {
-                        Text("Translating to spoken Sinhala...")
+                        Text(vm.loadingPlaceholder)
                             .font(.system(size: 13))
                             .foregroundColor(.secondary)
                             .italic()

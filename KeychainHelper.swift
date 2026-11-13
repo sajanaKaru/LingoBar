@@ -464,7 +464,7 @@ public final class KeychainHelper {
     /// Retrieves the stored API key from the macOS Keychain.
     /// Returns nil if item does not exist or was explicitly deleted, or throws KeychainError on system failure.
     public func getKey(account: String = defaultAccount, service: String = defaultService) throws -> String? {
-        if UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
+        if account == Self.defaultAccount && UserDefaults.standard.bool(forKey: Self.explicitDeletionFlagKey) {
             return nil
         }
 
@@ -495,11 +495,13 @@ public final class KeychainHelper {
     /// Deletes the stored API key from the macOS Keychain.
     /// Persists deletion intent and purges plaintext fallbacks first to ensure safety against partial Keychain deletion failure.
     public func deleteKey(account: String = defaultAccount, service: String = defaultService) throws {
-        // 1. Immediately record deletion intent and purge plaintext fallback keys
+        // 1. Immediately record deletion intent and purge plaintext fallback keys if default Groq account
         // Persisted first so partial failure of Keychain calls can never resurrect an old key on restart.
-        UserDefaults.standard.set(true, forKey: Self.explicitDeletionFlagKey)
-        UserDefaults.standard.removeObject(forKey: "com.lingobar.macos.fallback_api_key")
-        UserDefaults.standard.removeObject(forKey: "GROQ_API_KEY")
+        if account == Self.defaultAccount {
+            UserDefaults.standard.set(true, forKey: Self.explicitDeletionFlagKey)
+            UserDefaults.standard.removeObject(forKey: "com.lingobar.macos.fallback_api_key")
+            UserDefaults.standard.removeObject(forKey: "GROQ_API_KEY")
+        }
 
         // 2. Delete primary account from Keychain
         let query: [String: Any] = [

@@ -13,7 +13,8 @@ public struct SettingsView: View {
     @Binding public var isPresented: Bool
     public var onKeySaved: (() -> Void)?
 
-    @State private var selectedProvider: String = "Groq"
+    @State private var selectedProvider: AIProvider = AIProvider.current
+    @State private var selectedModel: String = AIProvider.current.selectedModel
     @State private var enteredKey: String = ""
     @State private var showKey: Bool = false
     @State private var keyStatus: KeyConnectionStatus = .notConfigured
@@ -22,6 +23,7 @@ public struct SettingsView: View {
     @State private var errorMessage: String = ""
     @State private var currentTestTask: URLSessionDataTask?
     @State private var currentTestRequestId: UUID?
+    @State private var currentTestTimeoutWorkItem: DispatchWorkItem?
     @State private var lastTestedKey: String = ""
     @State private var pendingConflictCandidates: [ConflictCandidate] = []
     @State private var selectedConflictCandidate: ConflictCandidate? = nil
@@ -58,8 +60,8 @@ public struct SettingsView: View {
 
             Divider()
 
-            // Conflict banner if conflicting keys exist in fallback storage
-            if !pendingConflictCandidates.isEmpty {
+            // Conflict banner if conflicting keys exist in fallback storage (Groq only)
+            if selectedProvider == .groq && !pendingConflictCandidates.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -104,10 +106,25 @@ public struct SettingsView: View {
                     .foregroundColor(.secondary)
 
                 Picker("", selection: $selectedProvider) {
-                    Text("Groq (Llama 3 / Qwen) — Recommended").tag("Groq")
-                    Text("OpenAI (Coming soon)").tag("OpenAI")
-                    Text("Anthropic (Coming soon)").tag("Anthropic")
-                    Text("Gemini (Coming soon)").tag("Gemini")
+                    ForEach(AIProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            // Model Selection Picker
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Model:")
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .foregroundColor(.secondary)
+
+                Picker("", selection: $selectedModel) {
+                    ForEach(selectedProvider.models, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
@@ -116,18 +133,16 @@ public struct SettingsView: View {
             // API Key Input Section
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Groq API Key:")
+                    Text(selectedProvider.keyPromptTitle)
                         .font(.caption)
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                     Spacer()
                     Button(action: {
-                        if let url = URL(string: "https://console.groq.com/keys") {
-                            NSWorkspace.shared.open(url)
-                        }
+                        NSWorkspace.shared.open(selectedProvider.consoleUrl)
                     }) {
                         HStack(spacing: 3) {
-                            Text("Get Free Key")
+                            Text((selectedProvider == .groq || selectedProvider == .gemini) ? "Get Free Key" : "Get API Key")
                             Image(systemName: "arrow.up.right.square")
                         }
                         .font(.caption)
@@ -138,11 +153,11 @@ public struct SettingsView: View {
 
                 HStack(spacing: 6) {
                     if showKey {
-                        TextField("gsk_...", text: $enteredKey)
+                        TextField(selectedProvider.keyPlaceholder, text: $enteredKey)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 12, design: .monospaced))
                     } else {
-                        SecureField("gsk_...", text: $enteredKey)
+                        SecureField(selectedProvider.keyPlaceholder, text: $enteredKey)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 12, design: .monospaced))
                     }
@@ -169,8 +184,8 @@ public struct SettingsView: View {
                 }
             }
 
-            // Legacy Vault Import option when primary key in Keychain is absent and legacy vault file exists
-            if isLegacyVaultAvailable && initialKey.isEmpty {
+            // Legacy Vault Import option when primary key in Keychain is absent and legacy vault file exists (Groq only)
+            if selectedProvider == .groq && isLegacyVaultAvailable && initialKey.isEmpty {
                 Button(action: importFromLegacyVault) {
                     HStack(spacing: 5) {
                         Image(systemName: "square.and.arrow.down")
@@ -294,6 +309,13 @@ public struct SettingsView: View {
         .onChange(of: enteredKey) { _, newKey in
             handleInputChanged(newKey: newKey)
         }
+        .onChange(of: selectedProvider) { _, newProvider in
+            handleProviderChanged(to: newProvider)
+        }
+        .onChange(of: selectedModel) { _, newModel in
+            selectedProvider.selectedModel = newModel
+            onKeySaved?()
+        }
     }
 
     private var isSaveDisabled: Bool {
@@ -307,6 +329,8 @@ public struct SettingsView: View {
 
     private func cancelInFlightTest() {
         currentTestRequestId = nil
+        currentTestTimeoutWorkItem?.cancel()
+        currentTestTimeoutWorkItem = nil
         currentTestTask?.cancel()
         currentTestTask = nil
         isTesting = false
@@ -331,24 +355,69 @@ public struct SettingsView: View {
     }
 
     private func loadCurrentKey() {
+        isPerformingProgrammaticClear = true
+        defer {
+            isPerformingProgrammaticClear = false
+        }
+        cancelInFlightTest()
         errorMessage = ""
+        enteredKey = ""
+        initialKey = ""
+        lastTestedKey = ""
+        keyStatus = .notConfigured
+        pendingConflictCandidates = []
+        selectedConflictCandidate = nil
+
         do {
-            if let key = try KeychainHelper.shared.getKey(), !key.isEmpty {
+            if let key = try KeychainHelper.shared.getKey(account: selectedProvider.keychainAccount), !key.isEmpty {
                 enteredKey = key
                 initialKey = key
                 keyStatus = .unverified
             } else {
+                enteredKey = ""
+                initialKey = ""
                 keyStatus = .notConfigured
             }
-            pendingConflictCandidates = try KeychainHelper.shared.getPendingConflictCandidates()
-            isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
-            if let warning = KeychainHelper.shared.fallbackRecoveryWarning, errorMessage.isEmpty {
-                errorMessage = warning
+            lastTestedKey = ""
+
+            if selectedProvider == .groq {
+                pendingConflictCandidates = try KeychainHelper.shared.getPendingConflictCandidates()
+                isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
+                if let warning = KeychainHelper.shared.fallbackRecoveryWarning, errorMessage.isEmpty {
+                    errorMessage = warning
+                }
+            } else {
+                pendingConflictCandidates = []
+                isLegacyVaultAvailable = false
             }
         } catch {
-            errorMessage = error.localizedDescription
+            enteredKey = ""
+            initialKey = ""
+            lastTestedKey = ""
             keyStatus = .notConfigured
+            pendingConflictCandidates = []
+            selectedConflictCandidate = nil
+            errorMessage = "Keychain error: \(error.localizedDescription)"
         }
+    }
+
+    private func handleProviderChanged(to newProvider: AIProvider) {
+        cancelInFlightTest()
+        isPerformingProgrammaticClear = true
+        enteredKey = ""
+        initialKey = ""
+        lastTestedKey = ""
+        keyStatus = .notConfigured
+        pendingConflictCandidates = []
+        selectedConflictCandidate = nil
+        errorMessage = ""
+        isPerformingProgrammaticClear = false
+
+        selectedProvider = newProvider
+        selectedModel = newProvider.selectedModel
+        AIProvider.current = newProvider
+        loadCurrentKey()
+        onKeySaved?()
     }
 
     private func applyConflictCandidate(_ candidate: ConflictCandidate) {
@@ -411,11 +480,11 @@ public struct SettingsView: View {
             keyStatus = .notConfigured
             pendingConflictCandidates = []
             selectedConflictCandidate = nil
-            isLegacyVaultAvailable = KeychainHelper.shared.isLegacyVaultKeyAvailable
+            isLegacyVaultAvailable = (selectedProvider == .groq) ? KeychainHelper.shared.isLegacyVaultKeyAvailable : false
             onKeySaved?()
         }
         do {
-            try KeychainHelper.shared.deleteKey()
+            try KeychainHelper.shared.deleteKey(account: selectedProvider.keychainAccount)
             return true
         } catch {
             errorMessage = "Failed to delete key: \(error.localizedDescription)"
@@ -438,18 +507,38 @@ public struct SettingsView: View {
         keyStatus = .testing
         errorMessage = ""
         let targetKey = trimmed
+        let targetProvider = selectedProvider
 
-        guard let url = URL(string: "https://api.groq.com/openai/v1/models") else {
-            isTesting = false
-            keyStatus = .invalid("Invalid URL")
-            return
-        }
+        let url = targetProvider.validationEndpoint
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(targetKey)", forHTTPHeaderField: "Authorization")
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 5.0
+        request.timeoutInterval = 3.0
+
+        let timeoutWorkItem = DispatchWorkItem { [targetKey, targetProvider] in
+            guard self.currentTestRequestId == requestId else {
+                return
+            }
+            self.currentTestRequestId = nil
+            self.currentTestTimeoutWorkItem = nil
+            self.currentTestTask?.cancel()
+            self.currentTestTask = nil
+            self.isTesting = false
+
+            guard self.selectedProvider == targetProvider else {
+                return
+            }
+            let currentTrimmed = self.enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard currentTrimmed == targetKey else {
+                return
+            }
+
+            self.keyStatus = .invalid("Connection timed out (3s)")
+        }
+        self.currentTestTimeoutWorkItem = timeoutWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: timeoutWorkItem)
 
         let task = URLSession.shared.dataTask(with: request) { _, response, error in
             DispatchQueue.main.async {
@@ -458,10 +547,15 @@ public struct SettingsView: View {
                     return
                 }
 
+                self.currentTestTimeoutWorkItem?.cancel()
+                self.currentTestTimeoutWorkItem = nil
                 self.isTesting = false
                 self.currentTestTask = nil
 
-                // Race condition check: Ensure the input text has not mutated
+                // Race condition check: Ensure provider and input text have not mutated
+                guard self.selectedProvider == targetProvider else {
+                    return
+                }
                 let currentTrimmed = self.enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard currentTrimmed == targetKey else {
                     return
@@ -472,7 +566,7 @@ public struct SettingsView: View {
                     if nsErr.code == NSURLErrorCancelled {
                         return
                     } else if nsErr.code == NSURLErrorTimedOut {
-                        self.keyStatus = .invalid("Connection timed out (5s)")
+                        self.keyStatus = .invalid("Connection timed out (3s)")
                     } else {
                         self.keyStatus = .invalid("Network error")
                     }
@@ -487,8 +581,14 @@ public struct SettingsView: View {
                 if httpResponse.statusCode == 200 {
                     self.keyStatus = .connected
                     self.lastTestedKey = targetKey
-                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                } else if httpResponse.statusCode == 400 {
+                    self.keyStatus = .invalid("Invalid Key (400)")
+                } else if httpResponse.statusCode == 401 {
                     self.keyStatus = .invalid("Invalid Key (401)")
+                } else if httpResponse.statusCode == 403 {
+                    self.keyStatus = .invalid("Access Forbidden (403)")
+                } else if httpResponse.statusCode == 429 {
+                    self.keyStatus = .invalid("Quota / Rate Limit (429)")
                 } else {
                     self.keyStatus = .invalid("Error (\(httpResponse.statusCode))")
                 }
@@ -501,6 +601,9 @@ public struct SettingsView: View {
     private func saveKey() {
         cancelInFlightTest()
         let trimmed = enteredKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !errorMessage.isEmpty && trimmed.isEmpty {
+            return
+        }
         errorMessage = ""
 
         if trimmed.isEmpty {
@@ -511,17 +614,21 @@ public struct SettingsView: View {
         }
 
         do {
-            try KeychainHelper.shared.saveKey(trimmed)
+            try KeychainHelper.shared.saveKey(trimmed, account: selectedProvider.keychainAccount)
             initialKey = trimmed
-            UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
-            isLegacyVaultAvailable = false
+            selectedProvider.selectedModel = selectedModel
+            AIProvider.current = selectedProvider
+            if selectedProvider == .groq {
+                UserDefaults.standard.set(true, forKey: "com.lingobar.macos.hasMigratedVaultV2")
+                isLegacyVaultAvailable = false
+            }
             onKeySaved?()
         } catch {
             errorMessage = "Failed to save key: \(error.localizedDescription)"
             return
         }
 
-        if let selected = selectedConflictCandidate, trimmed == selected.key {
+        if selectedProvider == .groq, let selected = selectedConflictCandidate, trimmed == selected.key {
             do {
                 try KeychainHelper.shared.discardConflictCandidate(id: selected.id)
                 selectedConflictCandidate = nil

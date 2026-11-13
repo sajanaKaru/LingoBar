@@ -10,6 +10,7 @@ STAGING_RESOURCES="${STAGING_CONTENTS}/Resources"
 
 REQUIRED_SOURCES=(
     "main.swift"
+    "AIProvider.swift"
     "KeychainHelper.swift"
     "SettingsView.swift"
     "Info.plist"
@@ -26,7 +27,7 @@ done
 echo "==> [Preflight] All required sources verified."
 
 echo "==> Building ${APP_NAME} binary with swiftc..."
-swiftc -parse-as-library main.swift KeychainHelper.swift SettingsView.swift -o "${APP_NAME}"
+swiftc -parse-as-library main.swift AIProvider.swift KeychainHelper.swift SettingsView.swift -o "${APP_NAME}"
 
 echo "==> Assembling bundle in staging directory..."
 rm -rf ".build_staging"
