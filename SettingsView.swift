@@ -142,7 +142,7 @@ public struct SettingsView: View {
                         NSWorkspace.shared.open(selectedProvider.consoleUrl)
                     }) {
                         HStack(spacing: 3) {
-                            Text(selectedProvider == .groq ? "Get Free Key" : "Get API Key")
+                            Text((selectedProvider == .groq || selectedProvider == .gemini) ? "Get Free Key" : "Get API Key")
                             Image(systemName: "arrow.up.right.square")
                         }
                         .font(.caption)
@@ -581,6 +581,8 @@ public struct SettingsView: View {
                 if httpResponse.statusCode == 200 {
                     self.keyStatus = .connected
                     self.lastTestedKey = targetKey
+                } else if httpResponse.statusCode == 400 {
+                    self.keyStatus = .invalid("Invalid Key (400)")
                 } else if httpResponse.statusCode == 401 {
                     self.keyStatus = .invalid("Invalid Key (401)")
                 } else if httpResponse.statusCode == 403 {

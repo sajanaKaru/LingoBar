@@ -984,8 +984,16 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 self.isLoading = false
                 let name = self.requestProvider.displayName
                 switch code {
+                case 400:
+                    if self.requestProvider == .gemini {
+                        self.errorMessage = "\(name) API error (400): Invalid or unauthorized API key."
+                    } else {
+                        self.errorMessage = "\(name) API error (400): Bad request."
+                    }
                 case 401:
                     self.errorMessage = "\(name) API error (401): Invalid or unauthorized API key."
+                case 403:
+                    self.errorMessage = "\(name) API error (403): Access forbidden or restricted API key."
                 case 429:
                     self.errorMessage = "\(name) API error (429): Rate limit or quota exceeded. Try again shortly."
                 default:
@@ -1075,7 +1083,15 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 let code = errorObj["code"] as? String
                 let name = self.requestProvider.displayName
                 if code == "insufficient_quota" || msg.lowercased().contains("quota") {
-                    let billingUrl = (self.requestProvider == .openAI) ? "platform.openai.com/account/billing" : "console.groq.com"
+                    let billingUrl: String
+                    switch self.requestProvider {
+                    case .openAI:
+                        billingUrl = "platform.openai.com/account/billing"
+                    case .gemini:
+                        billingUrl = "aistudio.google.com"
+                    case .groq:
+                        billingUrl = "console.groq.com"
+                    }
                     self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
                 } else {
                     self.errorMessage = "\(name) API error: \(msg)"
@@ -1121,7 +1137,15 @@ class PopoverViewModel: NSObject, ObservableObject, URLSessionDataDelegate {
                 let code = errorObj["code"] as? String
                 let msg = errorObj["message"] as? String ?? "Unable to complete request."
                 if code == "insufficient_quota" || msg.lowercased().contains("quota") {
-                    let billingUrl = (self.requestProvider == .openAI) ? "platform.openai.com/account/billing" : "console.groq.com"
+                    let billingUrl: String
+                    switch self.requestProvider {
+                    case .openAI:
+                        billingUrl = "platform.openai.com/account/billing"
+                    case .gemini:
+                        billingUrl = "aistudio.google.com"
+                    case .groq:
+                        billingUrl = "console.groq.com"
+                    }
                     self.errorMessage = "\(name) API error: You have exceeded your account quota. Check billing at \(billingUrl)."
                 } else {
                     self.errorMessage = "\(name) API error (\(responseStatusCode)): \(msg)"

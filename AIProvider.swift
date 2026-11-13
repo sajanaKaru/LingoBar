@@ -3,6 +3,7 @@ import Foundation
 public enum AIProvider: String, CaseIterable, Identifiable {
     case groq = "Groq"
     case openAI = "OpenAI"
+    case gemini = "Gemini"
 
     public var id: String { rawValue }
 
@@ -15,6 +16,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return "Groq"
         case .openAI:
             return "OpenAI"
+        case .gemini:
+            return "Gemini"
         }
     }
 
@@ -24,6 +27,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return "GROQ_API_KEY"
         case .openAI:
             return "OPENAI_API_KEY"
+        case .gemini:
+            return "GEMINI_API_KEY"
         }
     }
 
@@ -33,6 +38,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return URL(string: "https://api.groq.com/openai/v1/chat/completions")!
         case .openAI:
             return URL(string: "https://api.openai.com/v1/chat/completions")!
+        case .gemini:
+            return URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")!
         }
     }
 
@@ -42,6 +49,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return URL(string: "https://api.groq.com/openai/v1/models")!
         case .openAI:
             return URL(string: "https://api.openai.com/v1/models")!
+        case .gemini:
+            return URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/models")!
         }
     }
 
@@ -51,6 +60,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return "llama-3.3-70b-versatile"
         case .openAI:
             return "gpt-4o-mini"
+        case .gemini:
+            return "gemini-2.0-flash"
         }
     }
 
@@ -60,6 +71,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
         case .openAI:
             return ["gpt-4o-mini", "gpt-4o"]
+        case .gemini:
+            return ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
         }
     }
 
@@ -69,6 +82,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return URL(string: "https://console.groq.com/keys")!
         case .openAI:
             return URL(string: "https://platform.openai.com/api-keys")!
+        case .gemini:
+            return URL(string: "https://aistudio.google.com/app/apikey")!
         }
     }
 
@@ -78,6 +93,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return "gsk_..."
         case .openAI:
             return "sk-..."
+        case .gemini:
+            return "AIzaSy..."
         }
     }
 
@@ -87,6 +104,8 @@ public enum AIProvider: String, CaseIterable, Identifiable {
             return "Groq API Key:"
         case .openAI:
             return "OpenAI API Key:"
+        case .gemini:
+            return "Gemini API Key:"
         }
     }
 
