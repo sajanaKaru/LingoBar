@@ -187,12 +187,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarMenu() {
         guard let button = statusItem?.button else { return }
 
+        button.title = ""
+
         let menu = NSMenu()
         let translateItem = NSMenuItem(title: "Translate Selection", action: #selector(triggerFromMenu), keyEquivalent: "")
 
         if !viewModel.hotKeyConflictMessage.isEmpty {
-            button.title = "🇱🇰 LingoBar ⚠️"
-            button.toolTip = "LingoBar: Shortcut conflict detected. Click to translate."
+            let conflictIcon = NSImage(systemSymbolName: "exclamationmark.bubble", accessibilityDescription: "LingoBar - Shortcut Conflict: Click to Translate")
+            conflictIcon?.isTemplate = true
+            button.image = conflictIcon
+            button.toolTip = "LingoBar - Shortcut Conflict: Click to Translate"
 
             let conflictItem = NSMenuItem(title: "⚠️ Shortcut Conflict: Use Menu to Translate", action: nil, keyEquivalent: "")
             conflictItem.isEnabled = false
@@ -202,8 +206,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             translateItem.keyEquivalent = ""
             translateItem.keyEquivalentModifierMask = []
         } else {
-            button.title = "🇱🇰 LingoBar"
-            button.toolTip = "LingoBar (⌥Space to Translate Selection)"
+            let normalIcon = NSImage(systemSymbolName: "character.bubble", accessibilityDescription: "LingoBar")
+            normalIcon?.isTemplate = true
+            button.image = normalIcon
+            button.toolTip = "LingoBar - Option+Space"
 
             translateItem.keyEquivalent = " "
             translateItem.keyEquivalentModifierMask = [.option]
